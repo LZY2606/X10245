@@ -4,6 +4,11 @@
     <TargetFrameworks>net462;net6.0;net7.0</TargetFrameworks>
     <IsPackable>false</IsPackable>
     <LangVersion>Latest</LangVersion>
+    <!--
+      Allows the net6.0/net7.0 test targets to roll forward to a newer installed .NET runtime
+      (for example on build agents that only ship a current LTS). The targeted frameworks are unchanged.
+    -->
+    <RollForward Condition=" '$(OS)' != 'Windows_NT' ">Major</RollForward>
   </PropertyGroup>
 
   <ItemGroup>

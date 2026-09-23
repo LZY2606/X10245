@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Threading;
 using System.Text;
 using System.Threading.Tasks;
 
@@ -85,6 +86,29 @@ namespace CacheTower
 		/// <param name="settings">Cache control settings.</param>
 		/// <returns>The item from the cache that corresponds to the given <paramref name="cacheKey"/>.</returns>
 		ValueTask<T> GetOrSetAsync<T>(string cacheKey, Func<T, Task<T>> valueFactory, CacheSettings settings);
+		/// <summary>
+		/// Attempts to retrieve the value for the given <paramref name="cacheKey"/> with provenance information.
+		/// </summary>
+		/// <remarks>
+		/// Behaves identically to <see cref="GetOrSetAsync{T}(string, Func{T, Task{T}}, CacheSettings)"/> but additionally returns a
+		/// <see cref="CacheReadReceipt"/> describing whether the value came from the value factory or a specific cache layer and
+		/// whether it was fresh or stale. The receipt never alters the returned value.
+		/// <para>
+		/// When <see cref="CacheSettings.StaleWhileRevalidate"/> is set, an expired entry may be served within that window while a
+		/// single refresh is performed per cache key.
+		/// </para>
+		/// <para>
+		/// Cancelling <paramref name="cancellationToken"/> abandons the caller's wait only - a shared refresh already in progress
+		/// continues for other callers and is never cancelled.
+		/// </para>
+		/// </remarks>
+		/// <typeparam name="T">The type of value in the cache entry.</typeparam>
+		/// <param name="cacheKey">The cache entry's key.</param>
+		/// <param name="valueFactory">The value factory called when no cache entry is available.</param>
+		/// <param name="settings">Cache control settings, optionally enabling stale-while-revalidate.</param>
+		/// <param name="cancellationToken">A token to abandon waiting for a shared foreground refresh. It never cancels the refresh itself.</param>
+		/// <returns>The cached value paired with a receipt identifying its origin and freshness.</returns>
+		ValueTask<CacheReadResult<T>> GetOrSetAsync<T>(string cacheKey, Func<T, Task<T>> valueFactory, CacheSettings settings, CancellationToken cancellationToken);
 	}
 
 	/// <remarks>
@@ -136,5 +160,10 @@ namespace CacheTower
 		/// </remarks>
 		/// <inheritdoc cref="ICacheStack.GetOrSetAsync{T}(string, Func{T, Task{T}}, CacheSettings)"/>
 		ValueTask<T> GetOrSetAsync<T>(string cacheKey, Func<T, TContext, Task<T>> valueFactory, CacheSettings settings);
+		/// <remarks>
+		/// Additionally provides access to a context object during refreshing and returns a <see cref="CacheReadReceipt"/> for the read.
+		/// </remarks>
+		/// <inheritdoc cref="ICacheStack.GetOrSetAsync{T}(string, Func{T, Task{T}}, CacheSettings, System.Threading.CancellationToken)"/>
+		ValueTask<CacheReadResult<T>> GetOrSetAsync<T>(string cacheKey, Func<T, TContext, Task<T>> valueFactory, CacheSettings settings, CancellationToken cancellationToken);
 	}
 }

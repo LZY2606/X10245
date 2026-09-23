@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 
 namespace CacheTower
 {
@@ -18,6 +18,19 @@ namespace CacheTower
 		/// While optional, the cache will not perform a background refresh if <see cref="StaleAfter"/> is not set.
 		/// </remarks>
 		public TimeSpan? StaleAfter { get; }
+		/// <summary>
+		/// How long an expired entry may still be served while a single background refresh is performed.
+		/// </summary>
+		/// <remarks>
+		/// This is an opt-in stale-while-revalidate policy and defaults to <see langword="null"/> (disabled) so that
+		/// the default behaviour of never returning an expired entry is preserved.
+		/// <para>
+		/// When set, an entry that has passed its <see cref="TimeToLive"/> but not this additional window is returned to the caller
+		/// while exactly one refresh is triggered for the cache key. A failed refresh never extends this window -
+		/// once <see cref="TimeToLive"/> plus <see cref="StaleWhileRevalidate"/> elapses, the next read performs a foreground refresh.
+		/// </para>
+		/// </remarks>
+		public TimeSpan? StaleWhileRevalidate { get; }
 
 		/// <summary>
 		/// Configures the cache entry to have a life of <paramref name="timeToLive"/>.
@@ -30,6 +43,7 @@ namespace CacheTower
 		{
 			TimeToLive = timeToLive;
 			StaleAfter = null;
+			StaleWhileRevalidate = null;
 		}
 
 		/// <summary>
@@ -55,6 +69,42 @@ namespace CacheTower
 		{
 			TimeToLive = timeToLive;
 			StaleAfter = staleAfter;
+			StaleWhileRevalidate = null;
+		}
+
+		/// <summary>
+		/// Configures the cache entry with an opt-in stale-while-revalidate policy.
+		/// </summary>
+		/// <param name="timeToLive">How long till a cache entry is considered expired.</param>
+		/// <param name="staleAfter">How long till an unexpired entry is considered stale and eligible for a background refresh.</param>
+		/// <param name="staleWhileRevalidate">
+		/// How long an expired entry may still be served while a single background refresh is performed.
+		/// Pass <see langword="null"/> to keep the default behaviour of forcing a foreground refresh on expiry.
+		/// </param>
+		/// <exception cref="ArgumentOutOfRangeException">Thrown when <paramref name="staleWhileRevalidate"/> is negative.</exception>
+		public CacheSettings(TimeSpan timeToLive, TimeSpan staleAfter, TimeSpan? staleWhileRevalidate)
+		{
+			if (staleWhileRevalidate.HasValue && staleWhileRevalidate.Value < TimeSpan.Zero)
+			{
+				throw new ArgumentOutOfRangeException(nameof(staleWhileRevalidate), "The stale-while-revalidate window cannot be negative.");
+			}
+
+			TimeToLive = timeToLive;
+			StaleAfter = staleAfter;
+			StaleWhileRevalidate = staleWhileRevalidate;
+		}
+
+		/// <summary>
+		/// Calculates the latest point in time at which an entry may be served stale while a refresh is in progress.
+		/// </summary>
+		/// <param name="expiry">The expiry of the cache entry.</param>
+		/// <returns>
+		/// The stale-while-revalidate deadline, or the entry's <paramref name="expiry"/> when the policy is not enabled
+		/// (meaning an expired entry is never served).
+		/// </returns>
+		public DateTime GetStaleWhileRevalidateDate(DateTime expiry)
+		{
+			return StaleWhileRevalidate.HasValue ? expiry + StaleWhileRevalidate.Value : expiry;
 		}
 	}
 }
