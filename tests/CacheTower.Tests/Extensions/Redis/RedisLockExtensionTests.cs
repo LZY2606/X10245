@@ -11,6 +11,12 @@ namespace CacheTower.Tests.Extensions.Redis;
 [TestClass]
 public class RedisLockExtensionTests
 {
+	[TestInitialize]
+	public void Setup()
+	{
+		RedisHelper.RequireAvailable();
+	}
+
 	[TestMethod, ExpectedException(typeof(ArgumentNullException))]
 	public void ThrowForNullConnection()
 	{

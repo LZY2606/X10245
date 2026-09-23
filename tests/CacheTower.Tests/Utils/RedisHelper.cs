@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
 using StackExchange.Redis;
 
 namespace CacheTower.Tests.Utils;
@@ -11,22 +12,6 @@ public static class RedisHelper
 
 	private static readonly ConcurrentQueue<string> Errors = new();
 
-	static RedisHelper()
-	{
-		var connection = GetConnection();
-		connection.ErrorMessage += (sender, args) =>
-		{
-			Errors.Enqueue(args.Message);
-		};
-		connection.InternalError += (sender, args) =>
-		{
-			if (args.Exception is not null)
-			{
-				Errors.Enqueue(args.Exception.Message);
-			}
-		};
-	}
-
 	private static ConnectionMultiplexer Connection { get; set; }
 
 	public static ConnectionMultiplexer GetConnection()
@@ -35,12 +20,50 @@ public static class RedisHelper
 		{
 			var config = new ConfigurationOptions
 			{
-				AllowAdmin = true
+				AllowAdmin = true,
+				ConnectTimeout = 1000
 			};
 			config.EndPoints.Add(Endpoint);
 			Connection = ConnectionMultiplexer.Connect(config);
+			Connection.ErrorMessage += (sender, args) =>
+			{
+				Errors.Enqueue(args.Message);
+			};
+			Connection.InternalError += (sender, args) =>
+			{
+				if (args.Exception is not null)
+				{
+					Errors.Enqueue(args.Exception.Message);
+				}
+			};
 		}
 		return Connection;
+	}
+
+	/// <summary>
+	/// Whether a Redis server is reachable at <see cref="Endpoint"/>.
+	/// </summary>
+	public static bool IsAvailable()
+	{
+		try
+		{
+			return GetConnection().IsConnected;
+		}
+		catch
+		{
+			return false;
+		}
+	}
+
+	/// <summary>
+	/// Marks the current test as inconclusive when no Redis server is reachable, so the test suite does not require a running service.
+	/// </summary>
+	public static void RequireAvailable()
+	{
+		if (!IsAvailable())
+		{
+			Assert.Inconclusive($"Redis is not available at {Endpoint}. Start Redis or set REDIS_ENDPOINT to run this test.");
+		}
 	}
 
 	/// <summary>

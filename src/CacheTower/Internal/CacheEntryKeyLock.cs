@@ -5,9 +5,31 @@ using System.Threading.Tasks;
 
 namespace CacheTower.Internal;
 
+/// <summary>
+/// The notification passed to waiters of a key lock when the lock is released with a cache entry.
+/// </summary>
+internal readonly struct CacheKeyLockNotification
+{
+	/// <summary>
+	/// The cache entry the lock was released with.
+	/// </summary>
+	public ICacheEntry CacheEntry { get; }
+	/// <summary>
+	/// Where the cache entry was sourced from.
+	/// </summary>
+	public CacheReadSource Source { get; }
+
+	public CacheKeyLockNotification(ICacheEntry cacheEntry, CacheReadSource source)
+	{
+		CacheEntry = cacheEntry;
+		Source = source;
+	}
+}
+
 internal readonly struct CacheEntryKeyLock
 {
-	private readonly Dictionary<string, TaskCompletionSource<ICacheEntry>?> keyLocks = new(StringComparer.Ordinal);
+	private readonly Dictionary<string, TaskCompletionSource<CacheKeyLockNotification>?> keyLocks = new(StringComparer.Ordinal);
+	private readonly HashSet<string> evictedKeys = new(StringComparer.Ordinal);
 
 	public CacheEntryKeyLock() { }
 
@@ -28,15 +50,15 @@ internal readonly struct CacheEntryKeyLock
 		}
 	}
 
-	public Task<ICacheEntry> WaitAsync(string cacheKey)
+	public Task<CacheKeyLockNotification> WaitAsync(string cacheKey)
 	{
-		TaskCompletionSource<ICacheEntry>? completionSource;
+		TaskCompletionSource<CacheKeyLockNotification>? completionSource;
 
 		lock (keyLocks)
 		{
 			if (!keyLocks.TryGetValue(cacheKey, out completionSource) || completionSource == null)
 			{
-				completionSource = new TaskCompletionSource<ICacheEntry>();
+				completionSource = new TaskCompletionSource<CacheKeyLockNotification>();
 				keyLocks[cacheKey] = completionSource;
 			}
 		}
@@ -44,8 +66,48 @@ internal readonly struct CacheEntryKeyLock
 		return completionSource.Task;
 	}
 
+	/// <summary>
+	/// Returns a task that completes when the current lock holder for <paramref name="cacheKey"/> releases the lock, or <see langword="null"/> when no refresh is in flight for the key.
+	/// </summary>
+	public Task<CacheKeyLockNotification>? WaitForCompletionAsync(string cacheKey)
+	{
+		lock (keyLocks)
+		{
+			if (!keyLocks.ContainsKey(cacheKey))
+			{
+				return null;
+			}
+		}
+		return WaitAsync(cacheKey);
+	}
+
+	/// <summary>
+	/// Marks <paramref name="cacheKey"/> as evicted while a refresh is in flight, so the refresh does not resurrect the evicted value when it completes.
+	/// </summary>
+	public void NotifyEviction(string cacheKey)
+	{
+		lock (keyLocks)
+		{
+			if (keyLocks.ContainsKey(cacheKey))
+			{
+				evictedKeys.Add(cacheKey);
+			}
+		}
+	}
+
+	/// <summary>
+	/// Checks (and clears) whether <paramref name="cacheKey"/> was evicted during the current refresh. Only meaningful for the current lock holder.
+	/// </summary>
+	public bool ConsumeEviction(string cacheKey)
+	{
+		lock (keyLocks)
+		{
+			return evictedKeys.Remove(cacheKey);
+		}
+	}
+
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	private bool TryRemove(string cacheKey, out TaskCompletionSource<ICacheEntry>? completionSource)
+	private bool TryRemove(string cacheKey, out TaskCompletionSource<CacheKeyLockNotification>? completionSource)
 	{
 		lock (keyLocks)
 		{
@@ -62,11 +124,15 @@ internal readonly struct CacheEntryKeyLock
 		}
 	}
 
-	public void ReleaseLock(string cacheKey, ICacheEntry cacheEntry)
+	public void ReleaseLock(string cacheKey, ICacheEntry cacheEntry, CacheReadSource source)
 	{
 		if (TryRemove(cacheKey, out var completionSource))
 		{
-			completionSource?.TrySetResult(cacheEntry);
+			lock (keyLocks)
+			{
+				evictedKeys.Remove(cacheKey);
+			}
+			completionSource?.TrySetResult(new CacheKeyLockNotification(cacheEntry, source));
 		}
 	}
 
@@ -74,6 +140,10 @@ internal readonly struct CacheEntryKeyLock
 	{
 		if (TryRemove(cacheKey, out var completionSource))
 		{
+			lock (keyLocks)
+			{
+				evictedKeys.Remove(cacheKey);
+			}
 			completionSource?.SetException(exception);
 		}
 	}

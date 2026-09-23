@@ -20,6 +20,17 @@ namespace CacheTower
 		public TimeSpan? StaleAfter { get; }
 
 		/// <summary>
+		/// How long after expiry an expired cache entry may still be served while a refresh happens in the background.
+		/// </summary>
+		/// <remarks>
+		/// This is an opt-in stale-while-revalidate window. When <see langword="null"/> (the default), expired entries are never served and the existing behaviour is unchanged.
+		/// <para>
+		/// The window is always measured from the cache entry's own expiry - a failed refresh does not extend it.
+		/// </para>
+		/// </remarks>
+		public TimeSpan? StaleWhileRevalidateWindow { get; init; }
+
+		/// <summary>
 		/// Configures the cache entry to have a life of <paramref name="timeToLive"/>.
 		/// </summary>
 		/// <param name="timeToLive">
