@@ -18,6 +18,16 @@ namespace CacheTower
 		/// While optional, the cache will not perform a background refresh if <see cref="StaleAfter"/> is not set.
 		/// </remarks>
 		public TimeSpan? StaleAfter { get; }
+		/// <summary>
+		/// How long after expiry an expired entry may still be served while it revalidates in the background.
+		/// </summary>
+		/// <remarks>
+		/// While optional, expired entries are never served if <see cref="StaleWhileRevalidate"/> is not set.
+		/// <br/>
+		/// When set, a read of an entry expired for no longer than this window returns the expired value and triggers
+		/// at most one background refresh per key (stale-while-revalidate).
+		/// </remarks>
+		public TimeSpan? StaleWhileRevalidate { get; }
 
 		/// <summary>
 		/// Configures the cache entry to have a life of <paramref name="timeToLive"/>.
@@ -55,6 +65,31 @@ namespace CacheTower
 		{
 			TimeToLive = timeToLive;
 			StaleAfter = staleAfter;
+			StaleWhileRevalidate = null;
+		}
+
+		/// <summary>
+		/// Configures the cache entry to have a life of <paramref name="timeToLive"/>, to be considered stale after <paramref name="staleAfter"/>
+		/// and to remain servable for <paramref name="staleWhileRevalidate"/> after expiry.
+		/// </summary>
+		/// <remarks>
+		/// When there is a cache hit on an entry that is expired but within the stale-while-revalidate window,
+		/// the expired value is returned and a single background refresh is performed.
+		/// </remarks>
+		/// <param name="timeToLive">How long till a cache entry is considered expired.</param>
+		/// <param name="staleAfter">How long till a cache entry is considered stale.</param>
+		/// <param name="staleWhileRevalidate">How long after expiry an expired entry may still be served while it revalidates.</param>
+		/// <exception cref="ArgumentOutOfRangeException">Thrown when <paramref name="staleWhileRevalidate"/> is negative.</exception>
+		public CacheSettings(TimeSpan timeToLive, TimeSpan staleAfter, TimeSpan staleWhileRevalidate)
+		{
+			if (staleWhileRevalidate < TimeSpan.Zero)
+			{
+				throw new ArgumentOutOfRangeException(nameof(staleWhileRevalidate), staleWhileRevalidate, "The stale-while-revalidate window cannot be negative.");
+			}
+
+			TimeToLive = timeToLive;
+			StaleAfter = staleAfter;
+			StaleWhileRevalidate = staleWhileRevalidate;
 		}
 	}
 }
