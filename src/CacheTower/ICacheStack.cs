@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace CacheTower
@@ -85,6 +86,26 @@ namespace CacheTower
 		/// <param name="settings">Cache control settings.</param>
 		/// <returns>The item from the cache that corresponds to the given <paramref name="cacheKey"/>.</returns>
 		ValueTask<T> GetOrSetAsync<T>(string cacheKey, Func<T, Task<T>> valueFactory, CacheSettings settings);
+
+		/// <summary>
+		/// Attempts to retrieve the value for the given <paramref name="cacheKey"/>, falling back to <paramref name="valueFactory"/> when unavailable,
+		/// and reports where the returned value came from via a <see cref="CacheReadReceipt{T}"/>.
+		/// </summary>
+		/// <remarks>
+		/// This is the receipt-producing counterpart of <see cref="GetOrSetAsync{T}(string, Func{T, Task{T}}, CacheSettings)"/>; both share the same refresh and single-flight coordination.
+		/// <br/>
+		/// When <see cref="CacheSettings.StaleWhileRevalidateWindow"/> is set, an expired entry still within that window is returned with <see cref="CacheSource.Stale"/>
+		/// while a single background refresh is triggered for the cache key.
+		/// <br/>
+		/// The <paramref name="cancellationToken"/> only cancels this caller's own wait for a shared refresh; it never cancels the shared refresh itself.
+		/// </remarks>
+		/// <typeparam name="T">The type of value in the cache entry.</typeparam>
+		/// <param name="cacheKey">The cache entry's key.</param>
+		/// <param name="valueFactory">The value factory called when no cache entry is available.</param>
+		/// <param name="settings">Cache control settings.</param>
+		/// <param name="cancellationToken">A token that cancels this caller's wait for a shared refresh without cancelling the shared refresh itself.</param>
+		/// <returns>A <see cref="CacheReadReceipt{T}"/> pairing the value with the <see cref="CacheSource"/> it came from.</returns>
+		ValueTask<CacheReadReceipt<T>> GetOrSetWithReceiptAsync<T>(string cacheKey, Func<T, Task<T>> valueFactory, CacheSettings settings, CancellationToken cancellationToken = default);
 	}
 
 	/// <remarks>
