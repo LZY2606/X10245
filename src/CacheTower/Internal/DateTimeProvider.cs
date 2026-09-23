@@ -6,6 +6,8 @@ namespace CacheTower.Internal
 {
 	internal static class DateTimeProvider
 	{
+		private static bool IsTimeFrozen;
+
 		/// <summary>
 		/// The current <see cref="DateTime.UtcNow"/>, updated every second.
 		/// </summary>
@@ -21,7 +23,35 @@ namespace CacheTower.Internal
 		/// The alternative for the tests is just "waiting" an extra second between setting a value and retrieving it however that makes the testing slower and the tests more confusing.
 		/// </remarks>
 		[MethodImpl(MethodImplOptions.AggressiveInlining)]
-		public static void UpdateTime() => Now = DateTime.UtcNow;
+		public static void UpdateTime()
+		{
+			if (!IsTimeFrozen)
+			{
+				Now = DateTime.UtcNow;
+			}
+		}
+
+		/// <summary>
+		/// Freezes <see cref="Now"/> at the given time, preventing the internal timer from updating it until <see cref="UnfreezeTime"/> is called.
+		/// </summary>
+		/// <remarks>
+		/// This is intended for unit tests that require a controllable clock. It shares the exact same <see cref="Now"/>
+		/// read path as production code - no parallel time source is introduced.
+		/// </remarks>
+		internal static void FreezeTime(DateTime frozenTime)
+		{
+			IsTimeFrozen = true;
+			Now = frozenTime;
+		}
+
+		/// <summary>
+		/// Unfreezes the clock, restoring <see cref="Now"/> to track the current <see cref="DateTime.UtcNow"/> value.
+		/// </summary>
+		internal static void UnfreezeTime()
+		{
+			IsTimeFrozen = false;
+			UpdateTime();
+		}
 
 		[System.Diagnostics.CodeAnalysis.SuppressMessage("CodeQuality", "IDE0052:Remove unread private members", Justification = "Establishes timer and prevents it being garbage collected")]
 		private static readonly Timer DateTimeTimer = new(state => UpdateTime(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
