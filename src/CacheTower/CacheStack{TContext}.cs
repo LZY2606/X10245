@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 
@@ -59,5 +60,28 @@ public class CacheStack<TContext> : CacheStack, ICacheStack<TContext>
 			var context = (TContext)scope.Resolve(typeof(TContext));
 			return await getter(old, context).ConfigureAwait(false);
 		}, settings).ConfigureAwait(false);
+	}
+
+	/// <inheritdoc/>
+	public async ValueTask<CacheReadResult<T>> GetOrSetWithReceiptAsync<T>(string cacheKey, Func<T, TContext, Task<T>> getter, CacheSettings settings, CancellationToken cancellationToken = default)
+	{
+		ThrowIfDisposed();
+
+		if (cacheKey == null)
+		{
+			throw new ArgumentNullException(nameof(cacheKey));
+		}
+
+		if (getter == null)
+		{
+			throw new ArgumentNullException(nameof(getter));
+		}
+
+		return await GetOrSetWithReceiptAsync<T>(cacheKey, async (old) =>
+		{
+			using var scope = CacheContextActivator.BeginScope();
+			var context = (TContext)scope.Resolve(typeof(TContext));
+			return await getter(old, context).ConfigureAwait(false);
+		}, settings, cancellationToken).ConfigureAwait(false);
 	}
 }
