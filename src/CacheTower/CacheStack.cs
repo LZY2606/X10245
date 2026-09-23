@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 using CacheTower.Extensions;
 using CacheTower.Internal;
@@ -49,6 +50,7 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 	private bool Disposed;
 
 	private readonly CacheEntryKeyLock KeyLock = new();
+	private readonly EvictionVersionTracker EvictionTracker = new();
 	private readonly ILogger<CacheStack> Logger;
 	private readonly ICacheLayer[] CacheLayers;
 	private readonly ExtensionContainer Extensions;
@@ -103,6 +105,9 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 	{
 		ThrowIfDisposed();
 
+		//Record the flush before touching the layers so an in-flight refresh can avoid resurrecting deleted values
+		EvictionTracker.NotifyFlushed();
+
 		for (int i = 0, l = CacheLayers.Length; i < l; i++)
 		{
 			var layer = CacheLayers[i];
@@ -133,6 +138,9 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 		{
 			throw new ArgumentNullException(nameof(cacheKey));
 		}
+
+		//Record the eviction before touching the layers so an in-flight refresh can avoid resurrecting the old value
+		EvictionTracker.NotifyEvicted(cacheKey);
 
 		for (int i = 0, l = CacheLayers.Length; i < l; i++)
 		{
@@ -288,6 +296,36 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 	/// <inheritdoc/>
 	public async ValueTask<T> GetOrSetAsync<T>(string cacheKey, Func<T, Task<T>> valueFactory, CacheSettings settings)
 	{
+		var receipt = await GetOrSetWithReceiptAsync(cacheKey, valueFactory, settings, CancellationToken.None).ConfigureAwait(false);
+		return receipt.Value!;
+	}
+
+	/// <summary>
+	/// Attempts to retrieve the value for the given <paramref name="cacheKey"/>.
+	/// When unavailable, will fallback to use <paramref name="valueFactory"/> to generate the value, storing it in the cache.
+	/// </summary>
+	/// <remarks>
+	/// This is the same read path as <see cref="GetOrSetAsync{T}(string, Func{T, Task{T}}, CacheSettings)"/> but
+	/// additionally returns a <see cref="CacheReadReceipt{T}"/> describing where the value came from.
+	/// The receipt never changes the value itself.
+	/// <para>
+	/// When <see cref="CacheSettings.StaleWhileRevalidateWindow"/> is set, an expired entry within that window
+	/// is returned with <see cref="CacheValueSource.Stale"/> while a single background refresh is triggered for the key.
+	/// </para>
+	/// <para>
+	/// The <paramref name="cancellationToken"/> only stops this call from waiting - it never cancels the
+	/// underlying refresh, which is shared with other callers of the same key.
+	/// </para>
+	/// </remarks>
+	/// <typeparam name="T">The type of value in the cache entry.</typeparam>
+	/// <param name="cacheKey">The cache entry's key.</param>
+	/// <param name="valueFactory">The value factory called when no cache entry is available.</param>
+	/// <param name="settings">Cache control settings.</param>
+	/// <param name="cancellationToken">A token that stops this call from waiting for a shared refresh. The shared refresh itself is never cancelled.</param>
+	/// <returns>The item from the cache that corresponds to the given <paramref name="cacheKey"/> together with its source receipt.</returns>
+	/// <exception cref="ArgumentException">Thrown when <see cref="CacheSettings.StaleWhileRevalidateWindow"/> is negative.</exception>
+	public async ValueTask<CacheReadReceipt<T>> GetOrSetWithReceiptAsync<T>(string cacheKey, Func<T, Task<T>> valueFactory, CacheSettings settings, CancellationToken cancellationToken = default)
+	{
 		ThrowIfDisposed();
 
 		if (cacheKey == null)
@@ -300,14 +338,21 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 			throw new ArgumentNullException(nameof(valueFactory));
 		}
 
+		if (settings.StaleWhileRevalidateWindow.HasValue && settings.StaleWhileRevalidateWindow.Value < TimeSpan.Zero)
+		{
+			throw new ArgumentException("The stale-while-revalidate window cannot be negative.", nameof(settings));
+		}
+
+		cancellationToken.ThrowIfCancellationRequested();
+
 		var currentTime = DateTimeProvider.Now;
 		var cacheEntryPoint = await GetWithLayerIndexAsync<T>(cacheKey).ConfigureAwait(false);
 		var cacheEntryStatus = CacheEntryStatus.Stale;
 		if (cacheEntryPoint != default)
 		{
-			if (cacheEntryPoint.CacheEntry.Expiry > currentTime)
+			var cacheEntry = cacheEntryPoint.CacheEntry;
+			if (cacheEntry.Expiry > currentTime)
 			{
-				var cacheEntry = cacheEntryPoint.CacheEntry;
 				if (settings.StaleAfter.HasValue && cacheEntry.GetStaleDate(settings) < currentTime)
 				{
 					//If the cache entry is stale, refresh the value in the background
@@ -319,11 +364,18 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 					_ = BackPopulateCacheAsync(cacheEntryPoint.LayerIndex, cacheKey, cacheEntry);
 				}
 
-				return cacheEntry.Value!;
+				return new CacheReadReceipt<T>(cacheEntry.Value, cacheEntryPoint.LayerIndex == 0 ? CacheValueSource.MemoryLayer : CacheValueSource.FallbackLayer);
+			}
+			else if (settings.StaleWhileRevalidateWindow.HasValue && cacheEntry.Expiry + settings.StaleWhileRevalidateWindow.Value > currentTime)
+			{
+				//The entry is expired but still inside the opt-in stale-while-revalidate window:
+				//return the expired value and refresh it in the background (single-flight per key).
+				_ = RefreshValueAsync(cacheKey, valueFactory, settings, cacheEntryStatus);
+				return new CacheReadReceipt<T>(cacheEntry.Value, CacheValueSource.Stale);
 			}
 			else
 			{
-				//Refresh the value in the current thread because we only have expired data (we never return expired data)
+				//Refresh the value in the current thread because we only have expired data (expired data is never returned unless opted-in above)
 				cacheEntryStatus = CacheEntryStatus.Expired;
 			}
 		}
@@ -333,7 +385,9 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 			cacheEntryStatus = CacheEntryStatus.Miss;
 		}
 
-		return (await RefreshValueAsync(cacheKey, valueFactory, settings, cacheEntryStatus).ConfigureAwait(false))!.Value!;
+		var refreshTask = RefreshValueAsync(cacheKey, valueFactory, settings, cacheEntryStatus).AsTask();
+		var (refreshedEntry, producedByFactory) = await CancellationUtility.WaitWithCancellationAsync(refreshTask, cancellationToken).ConfigureAwait(false);
+		return new CacheReadReceipt<T>(refreshedEntry!.Value, producedByFactory ? CacheValueSource.Factory : CacheValueSource.Fresh);
 	}
 
 	private async ValueTask BackPopulateCacheAsync<T>(int fromIndexExclusive, string cacheKey, CacheEntry<T> cacheEntry)
@@ -358,7 +412,7 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 		}
 	}
 
-	private async ValueTask<CacheEntry<T>?> RefreshValueAsync<T>(string cacheKey, Func<T, Task<T>> asyncValueFactory, CacheSettings settings, CacheEntryStatus entryStatus)
+	private async ValueTask<(CacheEntry<T>? CacheEntry, bool ProducedByFactory)> RefreshValueAsync<T>(string cacheKey, Func<T, Task<T>> asyncValueFactory, CacheSettings settings, CacheEntryStatus entryStatus)
 	{
 		if (KeyLock.AcquireLock(cacheKey))
 		{
@@ -372,24 +426,37 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 					//This can happen due to the race condition of getting the values out of the cache.
 					//We can only do any of this because we have the local lock.
 					KeyLock.ReleaseLock(cacheKey, previousEntry);
-					return previousEntry;
+					return (previousEntry, false);
 				}
 
 				await using var distributedLock = await Extensions.AwaitAccessAsync(cacheKey).ConfigureAwait(false);
 
 				CacheEntry<T>? cacheEntry;
+				var producedByFactory = false;
 				if (distributedLock.IsLockOwner)
 				{
 					var oldValue = previousEntry != default ? previousEntry.Value : default;
+					var evictionVersion = EvictionTracker.GetVersion(cacheKey);
 					var refreshedValue = await asyncValueFactory(oldValue!).ConfigureAwait(false);
 					cacheEntry = new CacheEntry<T>(refreshedValue, settings.TimeToLive);
-					var cacheUpdateType = entryStatus switch
+					if (EvictionTracker.GetVersion(cacheKey) == evictionVersion)
 					{
-						CacheEntryStatus.Miss => CacheUpdateType.AddEntry,
-						_ => CacheUpdateType.AddOrUpdateEntry
-					};
-					await InternalSetAsync(cacheKey, cacheEntry, cacheUpdateType).ConfigureAwait(false);
+						var cacheUpdateType = entryStatus switch
+						{
+							CacheEntryStatus.Miss => CacheUpdateType.AddEntry,
+							_ => CacheUpdateType.AddOrUpdateEntry
+						};
+						await InternalSetAsync(cacheKey, cacheEntry, cacheUpdateType).ConfigureAwait(false);
+						EvictionTracker.ResetIfUnchanged(cacheKey, evictionVersion);
+					}
+					else
+					{
+						//The key was evicted (or the stack flushed) while the value was being refreshed.
+						//Skip the write so the deletion is honored and the old value is not resurrected.
+						Logger.LogDebug("Skipping cache write for CacheKey={CacheKey} because it was evicted or flushed during the refresh.", cacheKey);
+					}
 
+					producedByFactory = true;
 					KeyLock.ReleaseLock(cacheKey, cacheEntry);
 				}
 				else
@@ -397,7 +464,7 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 					cacheEntry = await GetAsync<T>(cacheKey).ConfigureAwait(false);
 				}
 
-				return cacheEntry;
+				return (cacheEntry, producedByFactory);
 			}
 			catch (Exception e)
 			{
@@ -412,14 +479,15 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 			if (currentEntry != null && currentEntry.GetStaleDate(settings) > DateTimeProvider.Now)
 			{
 				KeyLock.ReleaseLock(cacheKey, currentEntry);
-				return currentEntry;
+				return (currentEntry, false);
 			}
 
 			//Lock until we are notified to be unlocked
-			return await KeyLock.WaitAsync(cacheKey).ConfigureAwait(false) as CacheEntry<T>;
+			var waitedEntry = await KeyLock.WaitAsync(cacheKey).ConfigureAwait(false) as CacheEntry<T>;
+			return (waitedEntry, false);
 		}
 
-		return default;
+		return (default, false);
 	}
 
 	/// <summary>

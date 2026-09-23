@@ -11,6 +11,8 @@ namespace CacheTower.Internal
 		/// </summary>
 		public static DateTime Now { get; private set; } = DateTime.UtcNow;
 
+		private static volatile bool TimerUpdatesEnabled = true;
+
 		/// <summary>
 		/// Updates <see cref="Now"/> to the current <see cref="DateTime.UtcNow"/> value. This is automatically called by a timer every second.
 		/// </summary>
@@ -21,7 +23,36 @@ namespace CacheTower.Internal
 		/// The alternative for the tests is just "waiting" an extra second between setting a value and retrieving it however that makes the testing slower and the tests more confusing.
 		/// </remarks>
 		[MethodImpl(MethodImplOptions.AggressiveInlining)]
-		public static void UpdateTime() => Now = DateTime.UtcNow;
+		public static void UpdateTime()
+		{
+			if (TimerUpdatesEnabled)
+			{
+				Now = DateTime.UtcNow;
+			}
+		}
+
+		/// <summary>
+		/// Pins <see cref="Now"/> to <paramref name="fakeTime"/> and stops the automatic timer updates.
+		/// </summary>
+		/// <remarks>
+		/// This is a test-only hook (exposed via <c>InternalsVisibleTo</c>) that shares the exact same
+		/// <see cref="Now"/> read path as production code - no parallel time source is introduced.
+		/// Always pair with <see cref="RestoreRealTime"/>.
+		/// </remarks>
+		internal static void SetFakeTime(DateTime fakeTime)
+		{
+			TimerUpdatesEnabled = false;
+			Now = fakeTime;
+		}
+
+		/// <summary>
+		/// Resumes real time updates after <see cref="SetFakeTime"/> was used.
+		/// </summary>
+		internal static void RestoreRealTime()
+		{
+			TimerUpdatesEnabled = true;
+			UpdateTime();
+		}
 
 		[System.Diagnostics.CodeAnalysis.SuppressMessage("CodeQuality", "IDE0052:Remove unread private members", Justification = "Establishes timer and prevents it being garbage collected")]
 		private static readonly Timer DateTimeTimer = new(state => UpdateTime(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
