@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace CacheTower.Internal;
@@ -28,7 +29,7 @@ internal readonly struct CacheEntryKeyLock
 		}
 	}
 
-	public Task<ICacheEntry> WaitAsync(string cacheKey)
+	public Task<ICacheEntry> WaitAsync(string cacheKey, CancellationToken cancellationToken = default)
 	{
 		TaskCompletionSource<ICacheEntry>? completionSource;
 
@@ -41,7 +42,59 @@ internal readonly struct CacheEntryKeyLock
 			}
 		}
 
-		return completionSource.Task;
+		if (!cancellationToken.CanBeCanceled)
+		{
+			return completionSource.Task;
+		}
+
+		if (cancellationToken.IsCancellationRequested)
+		{
+			return Task.FromCanceled<ICacheEntry>(cancellationToken);
+		}
+
+		return WaitWithCancellationAsync(completionSource, cancellationToken);
+	}
+
+	private static async Task<ICacheEntry> WaitWithCancellationAsync(
+		TaskCompletionSource<ICacheEntry> sharedSource,
+		CancellationToken cancellationToken)
+	{
+		//Each cancelling waiter gets its own completion source so a caller cancelling their wait
+		//never cancels or faults the shared refresh other callers are waiting on.
+		var waiterSource = new TaskCompletionSource<ICacheEntry>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+		using (cancellationToken.Register(static state =>
+		{
+			var source = (TaskCompletionSource<ICacheEntry>)state!;
+			source.TrySetCanceled();
+		}, waiterSource))
+		{
+			var sharedTask = sharedSource.Task;
+			sharedTask.ContinueWith(
+				static (task, state) =>
+				{
+					var source = (TaskCompletionSource<ICacheEntry>)state!;
+					if (task.IsCanceled)
+					{
+						source.TrySetCanceled();
+					}
+					else if (task.IsFaulted)
+					{
+						source.TrySetException(task.Exception!.InnerException ?? task.Exception);
+					}
+					else
+					{
+						source.TrySetResult(task.Result);
+					}
+				},
+				waiterSource,
+				CancellationToken.None,
+				TaskContinuationOptions.ExecuteSynchronously,
+				TaskScheduler.Default
+			);
+
+			return await waiterSource.Task.ConfigureAwait(false);
+		}
 	}
 
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
