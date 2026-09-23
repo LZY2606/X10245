@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 using CacheTower.Extensions;
 using CacheTower.Internal;
@@ -289,7 +290,31 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 	public async ValueTask<T> GetOrSetAsync<T>(string cacheKey, Func<T, Task<T>> valueFactory, CacheSettings settings)
 	{
 		ThrowIfDisposed();
+		return (await GetOrSetCoreAsync(cacheKey, valueFactory, settings, null, CancellationToken.None).ConfigureAwait(false)).Value!;
+	}
 
+	/// <inheritdoc/>
+	public async ValueTask<CacheReadResult<T>> GetOrSetAsync<T>(string cacheKey, Func<T, Task<T>> valueFactory, CacheSettings settings, CacheReadOptions readOptions)
+	{
+		ThrowIfDisposed();
+		return await GetOrSetCoreAsync(cacheKey, valueFactory, settings, readOptions, readOptions.CancellationToken).ConfigureAwait(false);
+	}
+
+	/// <summary>
+	/// Shared read core used by both the default read strategy and the opt-in stale-while-revalidate read.
+	/// </summary>
+	/// <remarks>
+	/// When <paramref name="readOptions"/> is <see langword="null"/>, the value's expiry boundary and stale handling
+	/// follow the pre-existing default strategy exactly. When provided, expired entries within the
+	/// stale-while-revalidate window are served stale with a single shared background refresh.
+	/// </remarks>
+	private async ValueTask<CacheReadResult<T>> GetOrSetCoreAsync<T>(
+		string cacheKey,
+		Func<T, Task<T>> valueFactory,
+		CacheSettings settings,
+		CacheReadOptions? readOptions,
+		CancellationToken cancellationToken)
+	{
 		if (cacheKey == null)
 		{
 			throw new ArgumentNullException(nameof(cacheKey));
@@ -305,9 +330,9 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 		var cacheEntryStatus = CacheEntryStatus.Stale;
 		if (cacheEntryPoint != default)
 		{
-			if (cacheEntryPoint.CacheEntry.Expiry > currentTime)
+			var cacheEntry = cacheEntryPoint.CacheEntry;
+			if (cacheEntry.Expiry > currentTime)
 			{
-				var cacheEntry = cacheEntryPoint.CacheEntry;
 				if (settings.StaleAfter.HasValue && cacheEntry.GetStaleDate(settings) < currentTime)
 				{
 					//If the cache entry is stale, refresh the value in the background
@@ -319,13 +344,18 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 					_ = BackPopulateCacheAsync(cacheEntryPoint.LayerIndex, cacheKey, cacheEntry);
 				}
 
-				return cacheEntry.Value!;
+				return CacheReadResult<T>.FromCache(cacheEntry.Value, cacheEntryPoint.LayerIndex, false);
 			}
-			else
+
+			if (readOptions.HasValue && cacheEntry.Expiry + readOptions.Value.StaleWhileRevalidate >= currentTime)
 			{
-				//Refresh the value in the current thread because we only have expired data (we never return expired data)
-				cacheEntryStatus = CacheEntryStatus.Expired;
+				//Serve the expired-but-within-window value and ensure only a single shared refresh is in flight
+				ObserveFault(RefreshValueAsync(cacheKey, valueFactory, settings, cacheEntryStatus));
+				return CacheReadResult<T>.FromCache(cacheEntry.Value, cacheEntryPoint.LayerIndex, true);
 			}
+
+			//We never return expired data under the default strategy (nor past the stale-while-revalidate window)
+			cacheEntryStatus = CacheEntryStatus.Expired;
 		}
 		else
 		{
@@ -333,7 +363,8 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 			cacheEntryStatus = CacheEntryStatus.Miss;
 		}
 
-		return (await RefreshValueAsync(cacheKey, valueFactory, settings, cacheEntryStatus).ConfigureAwait(false))!.Value!;
+		var refreshedEntry = await RefreshForegroundAsync(cacheKey, valueFactory, settings, cacheEntryStatus, cancellationToken).ConfigureAwait(false);
+		return CacheReadResult<T>.FromFactory(refreshedEntry!.Value);
 	}
 
 	private async ValueTask BackPopulateCacheAsync<T>(int fromIndexExclusive, string cacheKey, CacheEntry<T> cacheEntry)
@@ -358,68 +389,134 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 		}
 	}
 
-	private async ValueTask<CacheEntry<T>?> RefreshValueAsync<T>(string cacheKey, Func<T, Task<T>> asyncValueFactory, CacheSettings settings, CacheEntryStatus entryStatus)
+	/// <summary>
+	/// Performs a fire-and-forget background refresh of a stale entry. Failures don't reach a caller.
+	/// </summary>
+	private async ValueTask RefreshValueAsync<T>(string cacheKey, Func<T, Task<T>> asyncValueFactory, CacheSettings settings, CacheEntryStatus entryStatus)
 	{
 		if (KeyLock.AcquireLock(cacheKey))
 		{
-			try
-			{
-				var previousEntry = await GetAsync<T>(cacheKey).ConfigureAwait(false);
-				if (previousEntry != default && entryStatus == CacheEntryStatus.Miss && previousEntry.Expiry >= DateTimeProvider.Now)
-				{
-					//The Cache Stack will always return an unexpired value if one exists.
-					//If we are told to refresh because one doesn't and we find one, we return the existing value, ignoring the refresh.
-					//This can happen due to the race condition of getting the values out of the cache.
-					//We can only do any of this because we have the local lock.
-					KeyLock.ReleaseLock(cacheKey, previousEntry);
-					return previousEntry;
-				}
-
-				await using var distributedLock = await Extensions.AwaitAccessAsync(cacheKey).ConfigureAwait(false);
-
-				CacheEntry<T>? cacheEntry;
-				if (distributedLock.IsLockOwner)
-				{
-					var oldValue = previousEntry != default ? previousEntry.Value : default;
-					var refreshedValue = await asyncValueFactory(oldValue!).ConfigureAwait(false);
-					cacheEntry = new CacheEntry<T>(refreshedValue, settings.TimeToLive);
-					var cacheUpdateType = entryStatus switch
-					{
-						CacheEntryStatus.Miss => CacheUpdateType.AddEntry,
-						_ => CacheUpdateType.AddOrUpdateEntry
-					};
-					await InternalSetAsync(cacheKey, cacheEntry, cacheUpdateType).ConfigureAwait(false);
-
-					KeyLock.ReleaseLock(cacheKey, cacheEntry);
-				}
-				else
-				{
-					cacheEntry = await GetAsync<T>(cacheKey).ConfigureAwait(false);
-				}
-
-				return cacheEntry;
-			}
-			catch (Exception e)
-			{
-				KeyLock.ReleaseLock(cacheKey, e);
-				throw;
-			}
+			await RunRefreshAsync(cacheKey, asyncValueFactory, settings, entryStatus).ConfigureAwait(false);
 		}
-		else if (entryStatus != CacheEntryStatus.Stale)
+	}
+
+	/// <summary>
+	/// Performs the foreground refresh shared by cache misses, expired entries and stale-while-revalidate window expiries.
+	/// </summary>
+	/// <remarks>
+	/// Exactly one caller per key owns the refresh; everyone else joins the same wait.
+	/// <paramref name="cancellationToken"/> only abandons a waiter - it never cancels the owner's shared refresh.
+	/// </remarks>
+	private ValueTask<CacheEntry<T>?> RefreshForegroundAsync<T>(string cacheKey, Func<T, Task<T>> asyncValueFactory, CacheSettings settings, CacheEntryStatus entryStatus, CancellationToken cancellationToken)
+	{
+		if (KeyLock.AcquireLock(cacheKey))
 		{
-			//Last minute check to confirm whether waiting is required
-			var currentEntry = await GetAsync<T>(cacheKey).ConfigureAwait(false);
-			if (currentEntry != null && currentEntry.GetStaleDate(settings) > DateTimeProvider.Now)
+			if (cancellationToken.CanBeCanceled)
 			{
-				KeyLock.ReleaseLock(cacheKey, currentEntry);
-				return currentEntry;
+				//Become a waiter on the refresh this call just started so a cancelling caller abandons its wait without cancelling the shared refresh.
+				var waitTask = KeyLock.WaitAsync(cacheKey, cancellationToken);
+				ObserveFault(RunRefreshAsync(cacheKey, asyncValueFactory, settings, entryStatus));
+				return WaitForResultAsync<T>(waitTask);
 			}
 
-			//Lock until we are notified to be unlocked
-			return await KeyLock.WaitAsync(cacheKey).ConfigureAwait(false) as CacheEntry<T>;
+			return RunRefreshAsync(cacheKey, asyncValueFactory, settings, entryStatus);
 		}
 
-		return default;
+		return WaitForRefreshAsync<T>(cacheKey, settings, cancellationToken);
+	}
+
+	private static async ValueTask<CacheEntry<T>?> WaitForResultAsync<T>(Task<ICacheEntry> waitTask)
+	{
+		return await waitTask.ConfigureAwait(false) as CacheEntry<T>;
+	}
+
+	private async ValueTask<CacheEntry<T>?> WaitForRefreshAsync<T>(string cacheKey, CacheSettings settings, CancellationToken cancellationToken)
+	{
+		//Last minute check to confirm whether waiting is required
+		var currentEntry = await GetAsync<T>(cacheKey).ConfigureAwait(false);
+		if (currentEntry != null && currentEntry.GetStaleDate(settings) > DateTimeProvider.Now)
+		{
+			KeyLock.ReleaseLock(cacheKey, currentEntry);
+			return currentEntry;
+		}
+
+		//Lock until we are notified to be unlocked
+		return await KeyLock.WaitAsync(cacheKey, cancellationToken).ConfigureAwait(false) as CacheEntry<T>;
+	}
+
+	private async ValueTask<CacheEntry<T>?> RunRefreshAsync<T>(string cacheKey, Func<T, Task<T>> asyncValueFactory, CacheSettings settings, CacheEntryStatus entryStatus)
+	{
+		try
+		{
+			var previousEntry = await GetAsync<T>(cacheKey).ConfigureAwait(false);
+			if (previousEntry != default && entryStatus == CacheEntryStatus.Miss && previousEntry.Expiry >= DateTimeProvider.Now)
+			{
+				//The Cache Stack will always return an unexpired value if one exists.
+				//If we are told to refresh because one doesn't and we find one, we return the existing value, ignoring the refresh.
+				//This can happen due to the race condition of getting the values out of the cache.
+				//We can only do any of this because we have the local lock.
+				KeyLock.ReleaseLock(cacheKey, previousEntry);
+				return previousEntry;
+			}
+
+			await using var distributedLock = await Extensions.AwaitAccessAsync(cacheKey).ConfigureAwait(false);
+
+			CacheEntry<T>? cacheEntry;
+			if (distributedLock.IsLockOwner)
+			{
+				var oldValue = previousEntry != default ? previousEntry.Value : default;
+				var refreshedValue = await asyncValueFactory(oldValue!).ConfigureAwait(false);
+				cacheEntry = new CacheEntry<T>(refreshedValue, settings.TimeToLive);
+				var cacheUpdateType = entryStatus switch
+				{
+					CacheEntryStatus.Miss => CacheUpdateType.AddEntry,
+					_ => CacheUpdateType.AddOrUpdateEntry
+				};
+				await InternalSetAsync(cacheKey, cacheEntry, cacheUpdateType).ConfigureAwait(false);
+
+				KeyLock.ReleaseLock(cacheKey, cacheEntry);
+			}
+			else
+			{
+				cacheEntry = await GetAsync<T>(cacheKey).ConfigureAwait(false);
+			}
+
+			return cacheEntry;
+		}
+		catch (Exception e)
+		{
+			KeyLock.ReleaseLock(cacheKey, e);
+			throw;
+		}
+
+	}
+
+	/// <summary>
+	/// Observes a detached refresh so a factory failure can't surface as an unobserved exception.
+	/// The refresh itself has already released the key lock (with the exception) for any joiners.
+	/// </summary>
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	private static void ObserveFault(ValueTask valueTask)
+	{
+		_ = valueTask.AsTask().ContinueWith(static task =>
+		{
+			if (task.IsFaulted)
+			{
+				_ = task.Exception;
+			}
+		}, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously | TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+	}
+
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	private static void ObserveFault<T>(ValueTask<T> valueTask)
+	{
+		_ = valueTask.AsTask().ContinueWith(static task =>
+		{
+			if (task.IsFaulted)
+			{
+				_ = task.Exception;
+			}
+		}, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously | TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
 	}
 
 	/// <summary>

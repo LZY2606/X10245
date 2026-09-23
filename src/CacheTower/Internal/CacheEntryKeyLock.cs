@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace CacheTower.Internal;
@@ -42,6 +43,41 @@ internal readonly struct CacheEntryKeyLock
 		}
 
 		return completionSource.Task;
+	}
+
+	/// <summary>
+	/// Waits for the lock to be released, observing <paramref name="cancellationToken"/> for the caller's wait only.
+	/// </summary>
+	/// <remarks>
+	/// Cancellation abandons the caller's wait - the shared refresh that owns the lock continues unaffected and later
+	/// releases the lock (and any other waiters) in the usual way.
+	/// </remarks>
+	public async Task<ICacheEntry> WaitAsync(string cacheKey, CancellationToken cancellationToken)
+	{
+		var waitTask = WaitAsync(cacheKey);
+		var cancellationTaskSource = new TaskCompletionSource<ICacheEntry>(TaskCreationOptions.RunContinuationsAsynchronously);
+		using var registration = cancellationToken.Register(static state =>
+		{
+			((TaskCompletionSource<ICacheEntry>)state!).TrySetCanceled();
+		}, cancellationTaskSource);
+
+		var completedTask = await Task.WhenAny(waitTask, cancellationTaskSource.Task).ConfigureAwait(false);
+		if (completedTask == waitTask)
+		{
+			return await waitTask.ConfigureAwait(false);
+		}
+
+		//Continue observing the refresh so an in-flight factory failure can't become an unobserved exception.
+		_ = waitTask.ContinueWith(static task =>
+		{
+			if (task.IsFaulted)
+			{
+				_ = task.Exception;
+			}
+		}, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously | TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+
+		//Propagates a TaskCanceledException while the shared refresh keeps running.
+		return await cancellationTaskSource.Task.ConfigureAwait(false);
 	}
 
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
