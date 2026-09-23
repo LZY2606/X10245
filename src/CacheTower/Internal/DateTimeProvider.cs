@@ -11,6 +11,8 @@ namespace CacheTower.Internal
 		/// </summary>
 		public static DateTime Now { get; private set; } = DateTime.UtcNow;
 
+		private static bool IsFixed;
+
 		/// <summary>
 		/// Updates <see cref="Now"/> to the current <see cref="DateTime.UtcNow"/> value. This is automatically called by a timer every second.
 		/// </summary>
@@ -23,7 +25,27 @@ namespace CacheTower.Internal
 		[MethodImpl(MethodImplOptions.AggressiveInlining)]
 		public static void UpdateTime() => Now = DateTime.UtcNow;
 
+		internal static void SetTime(DateTime value)
+		{
+			IsFixed = true;
+			Now = value.ToUniversalTime();
+		}
+
+		internal static void ResetTime()
+		{
+			IsFixed = false;
+			Now = DateTime.UtcNow;
+		}
+
+		private static void UpdateTimeFromTimer()
+		{
+			if (!IsFixed)
+			{
+				UpdateTime();
+			}
+		}
+
 		[System.Diagnostics.CodeAnalysis.SuppressMessage("CodeQuality", "IDE0052:Remove unread private members", Justification = "Establishes timer and prevents it being garbage collected")]
-		private static readonly Timer DateTimeTimer = new(state => UpdateTime(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+		private static readonly Timer DateTimeTimer = new(state => UpdateTimeFromTimer(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
 	}
 }

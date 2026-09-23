@@ -1,13 +1,14 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace CacheTower.Internal;
 
 internal readonly struct CacheEntryKeyLock
 {
-	private readonly Dictionary<string, TaskCompletionSource<ICacheEntry>?> keyLocks = new(StringComparer.Ordinal);
+	private readonly Dictionary<string, TaskCompletionSource<CacheRefreshCompletion>?> keyLocks = new(StringComparer.Ordinal);
 
 	public CacheEntryKeyLock() { }
 
@@ -28,24 +29,51 @@ internal readonly struct CacheEntryKeyLock
 		}
 	}
 
-	public Task<ICacheEntry> WaitAsync(string cacheKey)
+	public Task<CacheRefreshCompletion> WaitAsync(string cacheKey, CancellationToken cancellationToken = default)
 	{
-		TaskCompletionSource<ICacheEntry>? completionSource;
+		TaskCompletionSource<CacheRefreshCompletion>? completionSource;
 
 		lock (keyLocks)
 		{
 			if (!keyLocks.TryGetValue(cacheKey, out completionSource) || completionSource == null)
 			{
-				completionSource = new TaskCompletionSource<ICacheEntry>();
+				completionSource = new TaskCompletionSource<CacheRefreshCompletion>();
 				keyLocks[cacheKey] = completionSource;
 			}
 		}
 
-		return completionSource.Task;
+		return WaitWithCancellationAsync(completionSource.Task, cancellationToken);
+	}
+
+	private static async Task<CacheRefreshCompletion> WaitWithCancellationAsync(
+		Task<CacheRefreshCompletion> completionTask,
+		CancellationToken cancellationToken)
+	{
+		if (!cancellationToken.CanBeCanceled)
+		{
+			return await completionTask.ConfigureAwait(false);
+		}
+
+		var cancellationTaskSource = new TaskCompletionSource<bool>();
+		using (cancellationToken.Register(state => ((TaskCompletionSource<bool>)state!).TrySetResult(true), cancellationTaskSource))
+		{
+			if (cancellationToken.IsCancellationRequested)
+			{
+				throw new OperationCanceledException(cancellationToken);
+			}
+
+			var completedTask = await Task.WhenAny(completionTask, cancellationTaskSource.Task).ConfigureAwait(false);
+			if (ReferenceEquals(completedTask, completionTask))
+			{
+				return await completionTask.ConfigureAwait(false);
+			}
+
+			throw new OperationCanceledException(cancellationToken);
+		}
 	}
 
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	private bool TryRemove(string cacheKey, out TaskCompletionSource<ICacheEntry>? completionSource)
+	private bool TryRemove(string cacheKey, out TaskCompletionSource<CacheRefreshCompletion>? completionSource)
 	{
 		lock (keyLocks)
 		{
@@ -62,11 +90,11 @@ internal readonly struct CacheEntryKeyLock
 		}
 	}
 
-	public void ReleaseLock(string cacheKey, ICacheEntry cacheEntry)
+	public void ReleaseLock(string cacheKey, CacheRefreshCompletion completion)
 	{
 		if (TryRemove(cacheKey, out var completionSource))
 		{
-			completionSource?.TrySetResult(cacheEntry);
+			completionSource?.TrySetResult(completion);
 		}
 	}
 

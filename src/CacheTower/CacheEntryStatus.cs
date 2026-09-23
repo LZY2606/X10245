@@ -18,6 +18,10 @@ namespace CacheTower
 		/// </summary>
 		Expired,
 		/// <summary>
+		/// When an expired cache entry is returned by the stale-while-revalidate read strategy.
+		/// </summary>
+		StaleWhileRevalidate,
+		/// <summary>
 		/// When no cache entry was found.
 		/// </summary>
 		Miss

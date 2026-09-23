@@ -1,5 +1,7 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Threading;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using CacheTower.Extensions;
@@ -44,11 +46,13 @@ public readonly record struct CacheStackOptions
 /// <summary>
 /// A <see cref="CacheStack"/> is the backbone of caching for Cache Tower. This manages coordination between the various cache layers, manages the cache extensions and handles background refreshing.
 /// </summary>
-public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheStack, IAsyncDisposable
+public class CacheStack : ICacheStack, ICacheStackWithReadReceipts, IFlushableCacheStack, IExtendableCacheStack, IAsyncDisposable
 {
 	private bool Disposed;
 
 	private readonly CacheEntryKeyLock KeyLock = new();
+	private readonly CacheMutationCoordinator MutationCoordinator = new();
+	private readonly ConcurrentDictionary<string, Task> BackgroundRefreshes = new(StringComparer.Ordinal);
 	private readonly ILogger<CacheStack> Logger;
 	private readonly ICacheLayer[] CacheLayers;
 	private readonly ExtensionContainer Extensions;
@@ -103,6 +107,14 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 	{
 		ThrowIfDisposed();
 
+		using (await MutationCoordinator.AcquireFlushBarrierAsync().ConfigureAwait(false))
+		{
+			await FlushCoreAsync().ConfigureAwait(false);
+		}
+	}
+
+	private async ValueTask FlushCoreAsync()
+	{
 		for (int i = 0, l = CacheLayers.Length; i < l; i++)
 		{
 			var layer = CacheLayers[i];
@@ -134,13 +146,17 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 			throw new ArgumentNullException(nameof(cacheKey));
 		}
 
-		for (int i = 0, l = CacheLayers.Length; i < l; i++)
+		using var operation = MutationCoordinator.BeginOperation(cacheKey);
+		using (await MutationCoordinator.AcquireEvictionBarrierAsync(operation).ConfigureAwait(false))
 		{
-			var layer = CacheLayers[i];
-			await layer.EvictAsync(cacheKey).ConfigureAwait(false);
-		}
+			for (int i = 0, l = CacheLayers.Length; i < l; i++)
+			{
+				var layer = CacheLayers[i];
+				await layer.EvictAsync(cacheKey).ConfigureAwait(false);
+			}
 
-		await Extensions.OnCacheEvictionAsync(cacheKey).ConfigureAwait(false);
+			await Extensions.OnCacheEvictionAsync(cacheKey).ConfigureAwait(false);
+		}
 	}
 
 	/// <inheritdoc/>
@@ -154,7 +170,8 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 		}
 
 		var cacheEntry = new CacheEntry<T>(value, timeToLive);
-		await InternalSetAsync(cacheKey, cacheEntry, CacheUpdateType.AddOrUpdateEntry).ConfigureAwait(false);
+		using var operation = MutationCoordinator.BeginOperation(cacheKey);
+		await InternalSetAsync(cacheKey, cacheEntry, CacheUpdateType.AddOrUpdateEntry, operation).ConfigureAwait(false);
 		return cacheEntry;
 	}
 
@@ -173,10 +190,39 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 			throw new ArgumentNullException(nameof(cacheEntry));
 		}
 
-		await InternalSetAsync(cacheKey, cacheEntry, CacheUpdateType.AddOrUpdateEntry).ConfigureAwait(false);
+		using var operation = MutationCoordinator.BeginOperation(cacheKey);
+		await InternalSetAsync(cacheKey, cacheEntry, CacheUpdateType.AddOrUpdateEntry, operation).ConfigureAwait(false);
 	}
 
-	private async ValueTask InternalSetAsync<T>(string cacheKey, CacheEntry<T> cacheEntry, CacheUpdateType cacheUpdateType)
+	private async ValueTask InternalSetAsync<T>(
+		string cacheKey,
+		CacheEntry<T> cacheEntry,
+		CacheUpdateType cacheUpdateType,
+		CacheMutationCoordinator.CacheKeyOperation operation)
+	{
+		using var writeBarrier = await MutationCoordinator.AcquireCommitBarrierAsync(
+			operation,
+			default(CacheMutationCoordinator.CacheMutationClaim?)
+		).ConfigureAwait(false);
+
+		for (int i = 0, l = CacheLayers.Length; i < l; i++)
+		{
+			var layer = CacheLayers[i];
+
+			try
+			{
+				await layer.SetAsync(cacheKey, cacheEntry).ConfigureAwait(false);
+			}
+			catch (CacheSerializationException ex)
+			{
+				Logger.LogWarning(ex, "Unable to set CacheKey={CacheKey} on CacheLayer={CacheLayer} due to an exception. This will result in cache misses on this layer.", cacheKey, layer.GetType());
+			}
+		}
+
+		await Extensions.OnCacheUpdateAsync(cacheKey, cacheEntry.Expiry, cacheUpdateType).ConfigureAwait(false);
+	}
+
+	private async ValueTask WriteEntryCoreAsync<T>(string cacheKey, CacheEntry<T> cacheEntry, CacheUpdateType cacheUpdateType)
 	{
 		for (int i = 0, l = CacheLayers.Length; i < l; i++)
 		{
@@ -243,6 +289,7 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 			throw new ArgumentNullException(nameof(cacheKey));
 		}
 
+		using var operation = MutationCoordinator.BeginOperation(cacheKey);
 		var cacheEntryPoint = await GetWithLayerIndexAsync<T>(cacheKey).ConfigureAwait(false);
 		if (cacheEntryPoint == default)
 		{
@@ -254,7 +301,8 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 			return cacheEntryPoint.CacheEntry;
 		}
 
-		_ = BackPopulateCacheAsync(cacheEntryPoint.LayerIndex, cacheKey, cacheEntryPoint.CacheEntry);
+		var backfillOperation = operation.Branch();
+		_ = BackPopulateCacheAsync(cacheEntryPoint.LayerIndex, cacheKey, cacheEntryPoint.CacheEntry, backfillOperation);
 
 		return cacheEntryPoint.CacheEntry;
 	}
