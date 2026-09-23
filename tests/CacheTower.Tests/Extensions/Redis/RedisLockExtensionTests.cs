@@ -9,8 +9,14 @@ using StackExchange.Redis;
 namespace CacheTower.Tests.Extensions.Redis;
 
 [TestClass]
-public class RedisLockExtensionTests
+public class RedisLockExtensionTests : TestBase
 {
+	[TestInitialize]
+	public void Setup()
+	{
+		RequireRedis();
+	}
+
 	[TestMethod, ExpectedException(typeof(ArgumentNullException))]
 	public void ThrowForNullConnection()
 	{

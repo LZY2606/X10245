@@ -11,6 +11,8 @@ namespace CacheTower.Internal
 		/// </summary>
 		public static DateTime Now { get; private set; } = DateTime.UtcNow;
 
+		private static volatile bool IsTimeOverridden;
+
 		/// <summary>
 		/// Updates <see cref="Now"/> to the current <see cref="DateTime.UtcNow"/> value. This is automatically called by a timer every second.
 		/// </summary>
@@ -21,7 +23,35 @@ namespace CacheTower.Internal
 		/// The alternative for the tests is just "waiting" an extra second between setting a value and retrieving it however that makes the testing slower and the tests more confusing.
 		/// </remarks>
 		[MethodImpl(MethodImplOptions.AggressiveInlining)]
-		public static void UpdateTime() => Now = DateTime.UtcNow;
+		public static void UpdateTime()
+		{
+			if (!IsTimeOverridden)
+			{
+				Now = DateTime.UtcNow;
+			}
+		}
+
+		/// <summary>
+		/// Overrides <see cref="Now"/> with a fixed value, pausing the automatic time updates until <see cref="ResetNow"/> is called.
+		/// </summary>
+		/// <remarks>
+		/// This is a test-only fake clock hook (visible via <c>InternalsVisibleTo</c>).
+		/// It drives the exact same <see cref="Now"/> value that the production cache paths read - no parallel time source is introduced.
+		/// </remarks>
+		internal static void OverrideNow(DateTime now)
+		{
+			IsTimeOverridden = true;
+			Now = now;
+		}
+
+		/// <summary>
+		/// Removes any time override set by <see cref="OverrideNow"/> and resumes automatic time updates.
+		/// </summary>
+		internal static void ResetNow()
+		{
+			IsTimeOverridden = false;
+			Now = DateTime.UtcNow;
+		}
 
 		[System.Diagnostics.CodeAnalysis.SuppressMessage("CodeQuality", "IDE0052:Remove unread private members", Justification = "Establishes timer and prevents it being garbage collected")]
 		private static readonly Timer DateTimeTimer = new(state => UpdateTime(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));

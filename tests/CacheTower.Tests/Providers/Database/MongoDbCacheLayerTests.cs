@@ -15,6 +15,7 @@ public class MongoDbCacheLayerTests : BaseCacheLayerTests
 	[TestInitialize]
 	public async Task Setup()
 	{
+		RequireMongoDb();
 		await MongoDbHelper.DropDatabaseAsync();
 	}
 
