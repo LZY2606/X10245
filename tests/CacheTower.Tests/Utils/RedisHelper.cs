@@ -11,21 +11,29 @@ public static class RedisHelper
 
 	private static readonly ConcurrentQueue<string> Errors = new();
 
-	static RedisHelper()
+	private static readonly Lazy<bool> IsAvailableLazy = new(() =>
 	{
-		var connection = GetConnection();
-		connection.ErrorMessage += (sender, args) =>
+		try
 		{
-			Errors.Enqueue(args.Message);
-		};
-		connection.InternalError += (sender, args) =>
-		{
-			if (args.Exception is not null)
+			using var connection = ConnectionMultiplexer.Connect(new ConfigurationOptions
 			{
-				Errors.Enqueue(args.Exception.Message);
-			}
-		};
-	}
+				AllowAdmin = true,
+				ConnectTimeout = 1000,
+				AbortOnConnectFail = true,
+				EndPoints = { Endpoint }
+			});
+			return connection.IsConnected;
+		}
+		catch
+		{
+			return false;
+		}
+	});
+
+	/// <summary>
+	/// Whether a Redis server is reachable. Tests that require a live server should be marked inconclusive when this is false.
+	/// </summary>
+	public static bool IsAvailable => IsAvailableLazy.Value;
 
 	private static ConnectionMultiplexer Connection { get; set; }
 
@@ -35,10 +43,23 @@ public static class RedisHelper
 		{
 			var config = new ConfigurationOptions
 			{
-				AllowAdmin = true
+				AllowAdmin = true,
+				ConnectTimeout = 1000,
+				AbortOnConnectFail = false
 			};
 			config.EndPoints.Add(Endpoint);
 			Connection = ConnectionMultiplexer.Connect(config);
+			Connection.ErrorMessage += (sender, args) =>
+			{
+				Errors.Enqueue(args.Message);
+			};
+			Connection.InternalError += (sender, args) =>
+			{
+				if (args.Exception is not null)
+				{
+					Errors.Enqueue(args.Exception.Message);
+				}
+			};
 		}
 		return Connection;
 	}

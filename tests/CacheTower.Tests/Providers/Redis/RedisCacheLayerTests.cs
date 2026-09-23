@@ -12,11 +12,16 @@ namespace CacheTower.Tests.Providers.Redis
 	[TestClass]
 	public class RedisCacheLayerTests : BaseCacheLayerTests
 	{
-		[TestInitialize]
-		public void Setup()
+	[TestInitialize]
+	public void Setup()
+	{
+		if (!RedisHelper.IsAvailable)
 		{
-			RedisHelper.ResetState();
+			Assert.Inconclusive("Redis is not available at " + RedisHelper.Endpoint);
 		}
+
+		RedisHelper.ResetState();
+	}
 
 		[TestMethod]
 		public async Task GetSetCache()

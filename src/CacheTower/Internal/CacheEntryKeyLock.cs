@@ -7,7 +7,13 @@ namespace CacheTower.Internal;
 
 internal readonly struct CacheEntryKeyLock
 {
-	private readonly Dictionary<string, TaskCompletionSource<ICacheEntry>?> keyLocks = new(StringComparer.Ordinal);
+	private sealed class LockState
+	{
+		public TaskCompletionSource<ICacheEntry>? CompletionSource;
+		public int EvictionVersion;
+	}
+
+	private readonly Dictionary<string, LockState> keyLocks = new(StringComparer.Ordinal);
 
 	public CacheEntryKeyLock() { }
 
@@ -15,66 +21,90 @@ internal readonly struct CacheEntryKeyLock
 	{
 		lock (keyLocks)
 		{
-#if NETSTANDARD2_0
-			var hasLock = !keyLocks.ContainsKey(cacheKey);
-			if (hasLock)
+			if (keyLocks.ContainsKey(cacheKey))
 			{
-				keyLocks[cacheKey] = null;
+				return false;
 			}
-			return hasLock;
-#elif NETSTANDARD2_1
-			return keyLocks.TryAdd(cacheKey, null);
-#endif
+			keyLocks[cacheKey] = new LockState();
+			return true;
 		}
 	}
 
 	public Task<ICacheEntry> WaitAsync(string cacheKey)
 	{
-		TaskCompletionSource<ICacheEntry>? completionSource;
+		LockState? lockState;
 
 		lock (keyLocks)
 		{
-			if (!keyLocks.TryGetValue(cacheKey, out completionSource) || completionSource == null)
+			if (!keyLocks.TryGetValue(cacheKey, out lockState))
 			{
-				completionSource = new TaskCompletionSource<ICacheEntry>();
-				keyLocks[cacheKey] = completionSource;
+				lockState = new LockState();
+				keyLocks[cacheKey] = lockState;
+			}
+			if (lockState.CompletionSource == null)
+			{
+				lockState.CompletionSource = new TaskCompletionSource<ICacheEntry>();
 			}
 		}
 
-		return completionSource.Task;
+		return lockState.CompletionSource.Task;
 	}
 
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	private bool TryRemove(string cacheKey, out TaskCompletionSource<ICacheEntry>? completionSource)
+	private bool TryRemove(string cacheKey, out LockState? lockState)
 	{
 		lock (keyLocks)
 		{
-#if NETSTANDARD2_0
-			if (keyLocks.TryGetValue(cacheKey, out completionSource))
+			if (keyLocks.TryGetValue(cacheKey, out lockState))
 			{
 				keyLocks.Remove(cacheKey);
 				return true;
 			}
 			return false;
-#elif NETSTANDARD2_1
-			return keyLocks.Remove(cacheKey, out completionSource);
-#endif
+		}
+	}
+
+	/// <summary>
+	/// Returns the current eviction version for <paramref name="cacheKey"/>.
+	/// An in-flight refresh captures this before running and compares it before writing;
+	/// a mismatch means an eviction raced the refresh and the refreshed value must not be resurrected into the cache.
+	/// </summary>
+	public int GetEvictionVersion(string cacheKey)
+	{
+		lock (keyLocks)
+		{
+			return keyLocks.TryGetValue(cacheKey, out var lockState) ? lockState.EvictionVersion : 0;
+		}
+	}
+
+	/// <summary>
+	/// Records that <paramref name="cacheKey"/> was evicted. Only tracked while a refresh holds the key lock;
+	/// evictions outside a refresh need no tracking.
+	/// </summary>
+	public void NotifyEviction(string cacheKey)
+	{
+		lock (keyLocks)
+		{
+			if (keyLocks.TryGetValue(cacheKey, out var lockState))
+			{
+				lockState.EvictionVersion++;
+			}
 		}
 	}
 
 	public void ReleaseLock(string cacheKey, ICacheEntry cacheEntry)
 	{
-		if (TryRemove(cacheKey, out var completionSource))
+		if (TryRemove(cacheKey, out var lockState))
 		{
-			completionSource?.TrySetResult(cacheEntry);
+			lockState?.CompletionSource?.TrySetResult(cacheEntry);
 		}
 	}
 
 	public void ReleaseLock(string cacheKey, Exception exception)
 	{
-		if (TryRemove(cacheKey, out var completionSource))
+		if (TryRemove(cacheKey, out var lockState))
 		{
-			completionSource?.SetException(exception);
+			lockState?.CompletionSource?.SetException(exception);
 		}
 	}
 }
