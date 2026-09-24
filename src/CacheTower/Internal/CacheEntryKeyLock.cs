@@ -5,76 +5,148 @@ using System.Threading.Tasks;
 
 namespace CacheTower.Internal;
 
-internal readonly struct CacheEntryKeyLock
+/// <summary>
+/// Co-ordinates single-flight refreshes per cache key and tracks the eviction generation of a key.
+/// </summary>
+/// <remarks>
+/// The eviction generation increments on every <see cref="NotifyEvicted"/> call.
+/// Refresh callers capture the generation when acquiring the lock and compare it before committing a refreshed entry -
+/// if an eviction happened while the value factory was running, the refreshed entry is not written back,
+/// preventing a delete/refresh race from resurrecting an evicted value.
+/// </remarks>
+internal sealed class CacheEntryKeyLock
 {
-	private readonly Dictionary<string, TaskCompletionSource<ICacheEntry>?> keyLocks = new(StringComparer.Ordinal);
+	private sealed class KeyState
+	{
+		public long EvictionGeneration;
+		public bool IsLocked;
+		public TaskCompletionSource<ICacheEntry>? CompletionSource;
+	}
+
+	private readonly object SyncLock = new();
+	private readonly Dictionary<string, KeyState> keyStates = new(StringComparer.Ordinal);
 
 	public CacheEntryKeyLock() { }
 
-	public bool AcquireLock(string cacheKey)
+	private KeyState GetOrCreateState(string cacheKey)
 	{
-		lock (keyLocks)
+		if (!keyStates.TryGetValue(cacheKey, out var state))
 		{
-#if NETSTANDARD2_0
-			var hasLock = !keyLocks.ContainsKey(cacheKey);
-			if (hasLock)
+			state = new KeyState();
+			keyStates[cacheKey] = state;
+		}
+		return state;
+	}
+
+	/// <summary>
+	/// Attempts to acquire the single-flight lock for <paramref name="cacheKey"/>.
+	/// When successful, outputs the eviction generation observed at acquisition - compare it with
+	/// <see cref="GetEvictionGeneration"/> before committing a refreshed value.
+	/// </summary>
+	public bool AcquireLock(string cacheKey, out long evictionGeneration)
+	{
+		lock (SyncLock)
+		{
+			var state = GetOrCreateState(cacheKey);
+			if (state.IsLocked)
 			{
-				keyLocks[cacheKey] = null;
+				evictionGeneration = state.EvictionGeneration;
+				return false;
 			}
-			return hasLock;
-#elif NETSTANDARD2_1
-			return keyLocks.TryAdd(cacheKey, null);
-#endif
+
+			state.IsLocked = true;
+			state.CompletionSource = null;
+			evictionGeneration = state.EvictionGeneration;
+			return true;
+		}
+	}
+
+	/// <summary>
+	/// Gets the current eviction generation for <paramref name="cacheKey"/>.
+	/// </summary>
+	public long GetEvictionGeneration(string cacheKey)
+	{
+		lock (SyncLock)
+		{
+			return keyStates.TryGetValue(cacheKey, out var state) ? state.EvictionGeneration : 0;
+		}
+	}
+
+	/// <summary>
+	/// Records that <paramref name="cacheKey"/> was evicted, incrementing its eviction generation.
+	/// Any in-flight refresh that observed an earlier generation must not write its result back.
+	/// </summary>
+	public void NotifyEvicted(string cacheKey)
+	{
+		lock (SyncLock)
+		{
+			var state = GetOrCreateState(cacheKey);
+			state.EvictionGeneration++;
+			if (!state.IsLocked && state.CompletionSource == null)
+			{
+				keyStates.Remove(cacheKey);
+			}
 		}
 	}
 
 	public Task<ICacheEntry> WaitAsync(string cacheKey)
 	{
-		TaskCompletionSource<ICacheEntry>? completionSource;
-
-		lock (keyLocks)
+		lock (SyncLock)
 		{
-			if (!keyLocks.TryGetValue(cacheKey, out completionSource) || completionSource == null)
+			var state = GetOrCreateState(cacheKey);
+			if (state.CompletionSource == null)
 			{
-				completionSource = new TaskCompletionSource<ICacheEntry>();
-				keyLocks[cacheKey] = completionSource;
-			}
-		}
-
-		return completionSource.Task;
-	}
-
-	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	private bool TryRemove(string cacheKey, out TaskCompletionSource<ICacheEntry>? completionSource)
-	{
-		lock (keyLocks)
-		{
-#if NETSTANDARD2_0
-			if (keyLocks.TryGetValue(cacheKey, out completionSource))
-			{
-				keyLocks.Remove(cacheKey);
-				return true;
-			}
-			return false;
-#elif NETSTANDARD2_1
-			return keyLocks.Remove(cacheKey, out completionSource);
+				state.CompletionSource = new TaskCompletionSource<ICacheEntry>(
+#if NETSTANDARD2_1_OR_GREATER
+					TaskCreationOptions.RunContinuationsAsynchronously
 #endif
+				);
+			}
+			return state.CompletionSource.Task;
 		}
 	}
 
-	public void ReleaseLock(string cacheKey, ICacheEntry cacheEntry)
+	/// <summary>
+	/// Releases the single-flight lock for <paramref name="cacheKey"/>, completing any waiting refreshers with <paramref name="cacheEntry"/>.
+	/// The state is removed when the eviction generation hasn't changed since <paramref name="observedGeneration"/>;
+	/// otherwise the bumped generation is retained so a subsequent eviction is still observable.
+	/// </summary>
+	public void ReleaseLock(string cacheKey, long observedGeneration, ICacheEntry? cacheEntry)
 	{
-		if (TryRemove(cacheKey, out var completionSource))
+		lock (SyncLock)
 		{
-			completionSource?.TrySetResult(cacheEntry);
+			if (keyStates.TryGetValue(cacheKey, out var state))
+			{
+				var completionSource = state.CompletionSource;
+				state.IsLocked = false;
+				state.CompletionSource = null;
+				if (state.EvictionGeneration == observedGeneration)
+				{
+					keyStates.Remove(cacheKey);
+				}
+				completionSource?.TrySetResult(cacheEntry!);
+			}
 		}
 	}
 
-	public void ReleaseLock(string cacheKey, Exception exception)
+	/// <summary>
+	/// Releases the single-flight lock for <paramref name="cacheKey"/>, faulting any waiting refreshers with <paramref name="exception"/>.
+	/// </summary>
+	public void ReleaseLock(string cacheKey, long observedGeneration, Exception exception)
 	{
-		if (TryRemove(cacheKey, out var completionSource))
+		lock (SyncLock)
 		{
-			completionSource?.SetException(exception);
+			if (keyStates.TryGetValue(cacheKey, out var state))
+			{
+				var completionSource = state.CompletionSource;
+				state.IsLocked = false;
+				state.CompletionSource = null;
+				if (state.EvictionGeneration == observedGeneration)
+				{
+					keyStates.Remove(cacheKey);
+				}
+				completionSource?.TrySetException(exception);
+			}
 		}
 	}
 }

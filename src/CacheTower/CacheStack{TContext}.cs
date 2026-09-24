@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 
@@ -53,11 +54,34 @@ public class CacheStack<TContext> : CacheStack, ICacheStack<TContext>
 			throw new ArgumentNullException(nameof(getter));
 		}
 
-		return await GetOrSetAsync<T>(cacheKey, async (old) =>
+		return (await GetOrSetAsync<T>(cacheKey, async (old) =>
 		{
 			using var scope = CacheContextActivator.BeginScope();
 			var context = (TContext)scope.Resolve(typeof(TContext));
 			return await getter(old, context).ConfigureAwait(false);
-		}, settings).ConfigureAwait(false);
+		}, settings, CacheReadOptions.Default, CancellationToken.None).ConfigureAwait(false)).Value;
+	}
+
+	/// <inheritdoc/>
+	public ValueTask<CacheGetResult<T>> GetOrSetAsync<T>(string cacheKey, Func<T, TContext, Task<T>> getter, CacheSettings settings, CacheReadOptions readOptions, CancellationToken cancellationToken = default)
+	{
+		ThrowIfDisposed();
+
+		if (cacheKey == null)
+		{
+			throw new ArgumentNullException(nameof(cacheKey));
+		}
+
+		if (getter == null)
+		{
+			throw new ArgumentNullException(nameof(getter));
+		}
+
+		return GetOrSetAsync<T>(cacheKey, async (old) =>
+		{
+			using var scope = CacheContextActivator.BeginScope();
+			var context = (TContext)scope.Resolve(typeof(TContext));
+			return await getter(old, context).ConfigureAwait(false);
+		}, settings, readOptions, cancellationToken);
 	}
 }
