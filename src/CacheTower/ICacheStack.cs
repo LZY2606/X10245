@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace CacheTower
@@ -85,6 +86,24 @@ namespace CacheTower
 		/// <param name="settings">Cache control settings.</param>
 		/// <returns>The item from the cache that corresponds to the given <paramref name="cacheKey"/>.</returns>
 		ValueTask<T> GetOrSetAsync<T>(string cacheKey, Func<T, Task<T>> valueFactory, CacheSettings settings);
+
+		/// <summary>
+		/// Attempts to retrieve the value for the given <paramref name="cacheKey"/> like <see cref="GetOrSetAsync{T}(string, Func{T, Task{T}}, CacheSettings)"/>,
+		/// additionally returning a <see cref="CacheFetchReceipt"/> that describes where the value was served from. The receipt never changes the value.
+		/// </summary>
+		/// <remarks>
+		/// When <see cref="CacheSettings.StaleWhileRevalidateWindow"/> is set, an expired entry within that window is served with a
+		/// <see cref="CacheFetchSource.Stale"/> receipt while a single background refresh is triggered for the cache key.
+		/// <br/>
+		/// Cancelling <paramref name="cancellationToken"/> only abandons this caller's wait - it never cancels a shared in-flight refresh.
+		/// </remarks>
+		/// <typeparam name="T">The type of value in the cache entry.</typeparam>
+		/// <param name="cacheKey">The cache entry's key.</param>
+		/// <param name="valueFactory">The value factory called when no cache entry is available.</param>
+		/// <param name="settings">Cache control settings.</param>
+		/// <param name="cancellationToken">A token that cancels this caller's wait without cancelling any shared refresh.</param>
+		/// <returns>The <see cref="CacheFetchResult{T}"/> for the given <paramref name="cacheKey"/>.</returns>
+		ValueTask<CacheFetchResult<T>> GetOrSetWithReceiptAsync<T>(string cacheKey, Func<T, Task<T>> valueFactory, CacheSettings settings, CancellationToken cancellationToken = default);
 	}
 
 	/// <remarks>
@@ -136,5 +155,11 @@ namespace CacheTower
 		/// </remarks>
 		/// <inheritdoc cref="ICacheStack.GetOrSetAsync{T}(string, Func{T, Task{T}}, CacheSettings)"/>
 		ValueTask<T> GetOrSetAsync<T>(string cacheKey, Func<T, TContext, Task<T>> valueFactory, CacheSettings settings);
+
+		/// <remarks>
+		/// Additionally provides access to a context object during refreshing, allowing easier access to inject dependencies.
+		/// </remarks>
+		/// <inheritdoc cref="ICacheStack.GetOrSetWithReceiptAsync{T}(string, Func{T, Task{T}}, CacheSettings, CancellationToken)"/>
+		ValueTask<CacheFetchResult<T>> GetOrSetWithReceiptAsync<T>(string cacheKey, Func<T, TContext, Task<T>> valueFactory, CacheSettings settings, CancellationToken cancellationToken = default);
 	}
 }

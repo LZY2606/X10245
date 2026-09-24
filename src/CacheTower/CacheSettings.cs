@@ -19,6 +19,32 @@ namespace CacheTower
 		/// </remarks>
 		public TimeSpan? StaleAfter { get; }
 
+		private readonly TimeSpan? staleWhileRevalidateWindow;
+
+		/// <summary>
+		/// How long after expiry a stale (expired) cache entry may still be served while a single background refresh is triggered.
+		/// </summary>
+		/// <remarks>
+		/// This is an opt-in stale-while-revalidate read policy: when <see langword="null"/> (the default), expired entries are never served and a foreground refresh is performed instead.
+		/// <br/>
+		/// When set, an expired entry whose expiry is still within this window is returned to the caller and, for any given cache key, only one refresh is triggered at a time.
+		/// A failed refresh does not extend the window - the window always ends at the entry's expiry plus this value.
+		/// </remarks>
+		/// <exception cref="ArgumentOutOfRangeException">Thrown when the window is negative.</exception>
+		public TimeSpan? StaleWhileRevalidateWindow
+		{
+			get => staleWhileRevalidateWindow;
+			init
+			{
+				if (value.HasValue && value.Value < TimeSpan.Zero)
+				{
+					throw new ArgumentOutOfRangeException(nameof(value), "The stale-while-revalidate window cannot be negative.");
+				}
+
+				staleWhileRevalidateWindow = value;
+			}
+		}
+
 		/// <summary>
 		/// Configures the cache entry to have a life of <paramref name="timeToLive"/>.
 		/// </summary>
