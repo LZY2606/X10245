@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
 using StackExchange.Redis;
 
 namespace CacheTower.Tests.Utils;
@@ -11,22 +12,6 @@ public static class RedisHelper
 
 	private static readonly ConcurrentQueue<string> Errors = new();
 
-	static RedisHelper()
-	{
-		var connection = GetConnection();
-		connection.ErrorMessage += (sender, args) =>
-		{
-			Errors.Enqueue(args.Message);
-		};
-		connection.InternalError += (sender, args) =>
-		{
-			if (args.Exception is not null)
-			{
-				Errors.Enqueue(args.Exception.Message);
-			}
-		};
-	}
-
 	private static ConnectionMultiplexer Connection { get; set; }
 
 	public static ConnectionMultiplexer GetConnection()
@@ -35,12 +20,44 @@ public static class RedisHelper
 		{
 			var config = new ConfigurationOptions
 			{
-				AllowAdmin = true
+				AllowAdmin = true,
+				//Allow the connection object to be created even when no Redis server is reachable so
+				//tests that never issue commands still run; tests that need a live server call ResetState().
+				AbortOnConnectFail = false,
+				ConnectTimeout = 1000,
+				ConnectRetry = 0,
+				SyncTimeout = 1000
 			};
 			config.EndPoints.Add(Endpoint);
 			Connection = ConnectionMultiplexer.Connect(config);
+			Connection.ErrorMessage += (sender, args) =>
+			{
+				Errors.Enqueue(args.Message);
+			};
+			Connection.InternalError += (sender, args) =>
+			{
+				if (args.Exception is not null)
+				{
+					Errors.Enqueue(args.Exception.Message);
+				}
+			};
 		}
 		return Connection;
+	}
+
+	/// <summary>
+	/// Checks whether a Redis server is reachable at <see cref="Endpoint"/>.
+	/// </summary>
+	public static bool IsAvailable()
+	{
+		try
+		{
+			return GetConnection().GetDatabase().Ping() >= TimeSpan.Zero;
+		}
+		catch
+		{
+			return false;
+		}
 	}
 
 	/// <summary>
@@ -48,6 +65,11 @@ public static class RedisHelper
 	/// </summary>
 	public static void ResetState()
 	{
+		if (!IsAvailable())
+		{
+			Assert.Inconclusive($"Redis is not available at '{Endpoint}'; skipping test that requires a live Redis server.");
+		}
+
 		GetConnection().GetServer(Endpoint).FlushDatabase();
 		GetConnection().GetSubscriber().UnsubscribeAll();
 		

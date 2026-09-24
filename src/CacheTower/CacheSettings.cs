@@ -20,6 +20,16 @@ namespace CacheTower
 		public TimeSpan? StaleAfter { get; }
 
 		/// <summary>
+		/// How long after expiry a cache entry may still be returned while it is revalidated in the background.
+		/// </summary>
+		/// <remarks>
+		/// This is an opt-in stale-while-revalidate read strategy and is only honoured by
+		/// <see cref="ICacheStack.GetOrSetWithReceiptAsync{T}(string, Func{T, System.Threading.Tasks.Task{T}}, CacheSettings, System.Threading.CancellationToken)"/>.
+		/// When <see langword="null"/> (the default), expired entries are never returned and the default behaviour is unchanged.
+		/// </remarks>
+		public TimeSpan? StaleWhileRevalidate { get; init; }
+
+		/// <summary>
 		/// Configures the cache entry to have a life of <paramref name="timeToLive"/>.
 		/// </summary>
 		/// <param name="timeToLive">
