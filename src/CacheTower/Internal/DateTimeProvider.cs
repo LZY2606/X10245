@@ -6,10 +6,23 @@ namespace CacheTower.Internal
 {
 	internal static class DateTimeProvider
 	{
+		private static readonly object TimeSync = new();
+		private static DateTime TimerNow = DateTime.UtcNow;
+		private static DateTime? OverriddenNow;
+
 		/// <summary>
 		/// The current <see cref="DateTime.UtcNow"/>, updated every second.
 		/// </summary>
-		public static DateTime Now { get; private set; } = DateTime.UtcNow;
+		public static DateTime Now
+		{
+			get
+			{
+				lock (TimeSync)
+				{
+					return OverriddenNow ?? TimerNow;
+				}
+			}
+		}
 
 		/// <summary>
 		/// Updates <see cref="Now"/> to the current <see cref="DateTime.UtcNow"/> value. This is automatically called by a timer every second.
@@ -21,7 +34,28 @@ namespace CacheTower.Internal
 		/// The alternative for the tests is just "waiting" an extra second between setting a value and retrieving it however that makes the testing slower and the tests more confusing.
 		/// </remarks>
 		[MethodImpl(MethodImplOptions.AggressiveInlining)]
-		public static void UpdateTime() => Now = DateTime.UtcNow;
+		public static void UpdateTime()
+		{
+			lock (TimeSync)
+			{
+				TimerNow = DateTime.UtcNow;
+			}
+		}
+
+		/// <summary>
+		/// Overrides <see cref="Now"/> with a fixed value, acting as a fake clock. Pass <see langword="null"/> to return to the timer-driven clock.
+		/// </summary>
+		/// <remarks>
+		/// This is a test-only hook (visible via <c>InternalsVisibleTo</c>) and shares the exact same <see cref="Now"/> read path as production code -
+		/// there is no separate clock for tests. It is internal to keep it out of the public API surface.
+		/// </remarks>
+		internal static void OverrideNow(DateTime? now)
+		{
+			lock (TimeSync)
+			{
+				OverriddenNow = now;
+			}
+		}
 
 		[System.Diagnostics.CodeAnalysis.SuppressMessage("CodeQuality", "IDE0052:Remove unread private members", Justification = "Establishes timer and prevents it being garbage collected")]
 		private static readonly Timer DateTimeTimer = new(state => UpdateTime(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
