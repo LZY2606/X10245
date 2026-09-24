@@ -4,12 +4,16 @@ using System.Threading;
 
 namespace CacheTower.Internal
 {
-	internal static class DateTimeProvider
-	{
-		/// <summary>
-		/// The current <see cref="DateTime.UtcNow"/>, updated every second.
-		/// </summary>
-		public static DateTime Now { get; private set; } = DateTime.UtcNow;
+internal static class DateTimeProvider
+{
+	private static bool useFixedTime;
+
+	/// <summary>
+	/// The current <see cref="DateTime.UtcNow"/>, updated every second.
+	/// </summary>
+	public static DateTime Now => useFixedTime ? fixedTime : DateTime.UtcNow;
+
+	private static DateTime fixedTime = DateTime.UtcNow;
 
 		/// <summary>
 		/// Updates <see cref="Now"/> to the current <see cref="DateTime.UtcNow"/> value. This is automatically called by a timer every second.
@@ -20,10 +24,30 @@ namespace CacheTower.Internal
 		/// Real applications aren't immediately setting a cache value manually, calling <see cref="ICacheStack.GetOrSetAsync{T}(string, Func{T, System.Threading.Tasks.Task{T}}, CacheSettings)"/> and then comparing whether the results are the same.
 		/// The alternative for the tests is just "waiting" an extra second between setting a value and retrieving it however that makes the testing slower and the tests more confusing.
 		/// </remarks>
-		[MethodImpl(MethodImplOptions.AggressiveInlining)]
-		public static void UpdateTime() => Now = DateTime.UtcNow;
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	public static void UpdateTime()
+	{
+		if (!useFixedTime)
+		{
+			fixedTime = DateTime.UtcNow;
+		}
+	}
+
+	[System.Diagnostics.CodeAnalysis.SuppressMessage("Style", "IDE0051:Remove unused private members", Justification = "Used by deterministic regression tests through InternalsVisibleTo.")]
+	public static void SetTime(DateTime value)
+	{
+		fixedTime = value.ToUniversalTime();
+		useFixedTime = true;
+	}
+
+	[System.Diagnostics.CodeAnalysis.SuppressMessage("Style", "IDE0051:Remove unused private members", Justification = "Used by deterministic regression tests through InternalsVisibleTo.")]
+	public static void ResetTime()
+	{
+		useFixedTime = false;
+		fixedTime = DateTime.UtcNow;
+	}
 
 		[System.Diagnostics.CodeAnalysis.SuppressMessage("CodeQuality", "IDE0052:Remove unread private members", Justification = "Establishes timer and prevents it being garbage collected")]
-		private static readonly Timer DateTimeTimer = new(state => UpdateTime(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
-	}
+	private static readonly Timer DateTimeTimer = new(state => UpdateTime(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+}
 }

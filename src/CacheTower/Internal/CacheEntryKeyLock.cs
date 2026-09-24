@@ -1,80 +1,230 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
-using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace CacheTower.Internal;
 
-internal readonly struct CacheEntryKeyLock
+internal readonly struct RefreshStart
 {
-	private readonly Dictionary<string, TaskCompletionSource<ICacheEntry>?> keyLocks = new(StringComparer.Ordinal);
-
-	public CacheEntryKeyLock() { }
-
-	public bool AcquireLock(string cacheKey)
+	public RefreshStart(bool isLeader, long generation, Task<ICacheRefreshResult>? refreshTask)
 	{
-		lock (keyLocks)
+		IsLeader = isLeader;
+		Generation = generation;
+		RefreshTask = refreshTask;
+	}
+
+	public bool IsLeader { get; }
+	public long Generation { get; }
+	public Task<ICacheRefreshResult>? RefreshTask { get; }
+}
+
+internal sealed class CacheEntryKeyLock
+{
+	private sealed class KeyLockState
+	{
+		public SemaphoreSlim Semaphore { get; } = new(1, 1);
+		public TaskCompletionSource<ICacheRefreshResult>? RefreshCompletion { get; set; }
+		public int Operations { get; set; }
+		public bool RefreshRunning { get; set; }
+		public long Generation { get; set; }
+	}
+
+	private sealed class ExclusiveLockReleaser : IDisposable
+	{
+		private readonly CacheEntryKeyLock owner;
+		private readonly string cacheKey;
+		private readonly KeyLockState state;
+		private bool disposed;
+
+		public ExclusiveLockReleaser(CacheEntryKeyLock owner, string cacheKey, KeyLockState state)
 		{
-#if NETSTANDARD2_0
-			var hasLock = !keyLocks.ContainsKey(cacheKey);
-			if (hasLock)
+			this.owner = owner;
+			this.cacheKey = cacheKey;
+			this.state = state;
+		}
+
+		public void Dispose()
+		{
+			if (disposed)
 			{
-				keyLocks[cacheKey] = null;
+				return;
 			}
-			return hasLock;
-#elif NETSTANDARD2_1
-			return keyLocks.TryAdd(cacheKey, null);
-#endif
+
+			disposed = true;
+			state.Semaphore.Release();
+			owner.EndOperation(cacheKey, state);
 		}
 	}
 
-	public Task<ICacheEntry> WaitAsync(string cacheKey)
+	private readonly Dictionary<string, KeyLockState> keyLocks = new(StringComparer.Ordinal);
+
+	public RefreshStart BeginRefresh(string cacheKey)
 	{
-		TaskCompletionSource<ICacheEntry>? completionSource;
+		lock (keyLocks)
+		{
+			if (!keyLocks.TryGetValue(cacheKey, out var state))
+			{
+				state = new KeyLockState();
+				keyLocks.Add(cacheKey, state);
+			}
+
+			if (state.RefreshRunning)
+			{
+				return new RefreshStart(false, state.Generation, state.RefreshCompletion!.Task);
+			}
+
+			state.RefreshRunning = true;
+			state.RefreshCompletion = new TaskCompletionSource<ICacheRefreshResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+			state.Operations++;
+			return new RefreshStart(true, state.Generation, null);
+		}
+	}
+
+	public async Task<IDisposable> AcquireExclusiveAsync(string cacheKey)
+	{
+		KeyLockState state;
 
 		lock (keyLocks)
 		{
-			if (!keyLocks.TryGetValue(cacheKey, out completionSource) || completionSource == null)
+			if (!keyLocks.TryGetValue(cacheKey, out state))
 			{
-				completionSource = new TaskCompletionSource<ICacheEntry>();
-				keyLocks[cacheKey] = completionSource;
+				state = new KeyLockState();
+				keyLocks.Add(cacheKey, state);
+			}
+
+			state.Operations++;
+		}
+
+		await state.Semaphore.WaitAsync().ConfigureAwait(false);
+
+		lock (keyLocks)
+		{
+			state.Generation++;
+		}
+
+		return new ExclusiveLockReleaser(this, cacheKey, state);
+	}
+
+	public bool TryAcquireForBackPopulation(string cacheKey, out long generation)
+	{
+		lock (keyLocks)
+		{
+			if (!keyLocks.TryGetValue(cacheKey, out var state))
+			{
+				state = new KeyLockState();
+				keyLocks.Add(cacheKey, state);
+			}
+
+			if (state.RefreshRunning || !state.Semaphore.Wait(0))
+			{
+				generation = default;
+				return false;
+			}
+
+			state.Operations++;
+			generation = state.Generation;
+			return true;
+		}
+	}
+
+	public void ReleaseBackPopulation(string cacheKey, long generation)
+	{
+		if (!keyLocks.TryGetValue(cacheKey, out var state))
+		{
+			return;
+		}
+
+		state.Semaphore.Release();
+		EndOperation(cacheKey, state);
+	}
+
+	public async Task<ICacheRefreshResult> WaitForRefreshAsync(string cacheKey, Task<ICacheRefreshResult> refreshTask, CancellationToken cancellationToken)
+	{
+		var cancellationCompletion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+		using (cancellationToken.Register(state => ((TaskCompletionSource<bool>)state!).TrySetResult(true), cancellationCompletion))
+		{
+			var completedTask = await Task.WhenAny(refreshTask, cancellationCompletion.Task).ConfigureAwait(false);
+			if (completedTask == cancellationCompletion.Task)
+			{
+				throw new TaskCanceledException();
 			}
 		}
 
-		return completionSource.Task;
+		return await refreshTask.ConfigureAwait(false);
 	}
 
-	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	private bool TryRemove(string cacheKey, out TaskCompletionSource<ICacheEntry>? completionSource)
+	public void CompleteRefresh(string cacheKey, ICacheRefreshResult result)
+	{
+		if (TryEndRefresh(cacheKey, out var state, out var completion))
+		{
+			completion.TrySetResult(result);
+			state.Semaphore.Release();
+			EndOperation(cacheKey, state);
+		}
+	}
+
+	public void FailRefresh(string cacheKey, Exception exception)
+	{
+		if (TryEndRefresh(cacheKey, out var state, out var completion))
+		{
+			completion.TrySetException(exception);
+			state.Semaphore.Release();
+			EndOperation(cacheKey, state);
+		}
+	}
+
+	public void CancelRefresh(string cacheKey)
+	{
+		if (TryEndRefresh(cacheKey, out var state, out var completion))
+		{
+			completion.TrySetCanceled();
+			state.Semaphore.Release();
+			EndOperation(cacheKey, state);
+		}
+	}
+
+	public bool HasGenerationChanged(string cacheKey, long expectedGeneration)
 	{
 		lock (keyLocks)
 		{
-#if NETSTANDARD2_0
-			if (keyLocks.TryGetValue(cacheKey, out completionSource))
+			return keyLocks.TryGetValue(cacheKey, out var state) && state.Generation != expectedGeneration;
+		}
+	}
+
+	private bool TryEndRefresh(string cacheKey, out KeyLockState state, out TaskCompletionSource<ICacheRefreshResult> completion)
+	{
+		lock (keyLocks)
+		{
+			if (keyLocks.TryGetValue(cacheKey, out state!) && state.RefreshRunning)
 			{
-				keyLocks.Remove(cacheKey);
+				state.RefreshRunning = false;
+				completion = state.RefreshCompletion!;
+				state.RefreshCompletion = null;
 				return true;
 			}
+
+			completion = null!;
+			state = null!;
 			return false;
-#elif NETSTANDARD2_1
-			return keyLocks.Remove(cacheKey, out completionSource);
-#endif
 		}
 	}
 
-	public void ReleaseLock(string cacheKey, ICacheEntry cacheEntry)
+	private void EndOperation(string cacheKey, KeyLockState expectedState)
 	{
-		if (TryRemove(cacheKey, out var completionSource))
+		lock (keyLocks)
 		{
-			completionSource?.TrySetResult(cacheEntry);
-		}
-	}
+			if (!keyLocks.TryGetValue(cacheKey, out var state) || !ReferenceEquals(state, expectedState))
+			{
+				return;
+			}
 
-	public void ReleaseLock(string cacheKey, Exception exception)
-	{
-		if (TryRemove(cacheKey, out var completionSource))
-		{
-			completionSource?.SetException(exception);
+			state.Operations--;
+			if (state.Operations == 0 && !state.RefreshRunning && state.RefreshCompletion == null && state.Semaphore.CurrentCount == 1)
+			{
+				keyLocks.Remove(cacheKey);
+				state.Semaphore.Dispose();
+			}
 		}
 	}
 }

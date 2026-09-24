@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 using CacheTower.Extensions;
 using CacheTower.Internal;
@@ -134,13 +135,20 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 			throw new ArgumentNullException(nameof(cacheKey));
 		}
 
-		for (int i = 0, l = CacheLayers.Length; i < l; i++)
-		{
-			var layer = CacheLayers[i];
-			await layer.EvictAsync(cacheKey).ConfigureAwait(false);
-		}
+		await EvictInternalAsync(cacheKey).ConfigureAwait(false);
 
 		await Extensions.OnCacheEvictionAsync(cacheKey).ConfigureAwait(false);
+	}
+
+	private async ValueTask EvictInternalAsync(string cacheKey)
+	{
+		using (await KeyLock.AcquireExclusiveAsync(cacheKey).ConfigureAwait(false))
+		{
+			for (int i = 0, l = CacheLayers.Length; i < l; i++)
+			{
+				await CacheLayers[i].EvictAsync(cacheKey).ConfigureAwait(false);
+			}
+		}
 	}
 
 	/// <inheritdoc/>
@@ -176,8 +184,9 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 		await InternalSetAsync(cacheKey, cacheEntry, CacheUpdateType.AddOrUpdateEntry).ConfigureAwait(false);
 	}
 
-	private async ValueTask InternalSetAsync<T>(string cacheKey, CacheEntry<T> cacheEntry, CacheUpdateType cacheUpdateType)
+	private async ValueTask<bool> InternalSetAsync<T>(string cacheKey, CacheEntry<T> cacheEntry, CacheUpdateType cacheUpdateType, long? expectedGeneration = null)
 	{
+		var writeGeneration = expectedGeneration ?? 0;
 		for (int i = 0, l = CacheLayers.Length; i < l; i++)
 		{
 			var layer = CacheLayers[i];
@@ -190,9 +199,16 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 			{
 				Logger.LogWarning(ex, "Unable to set CacheKey={CacheKey} on CacheLayer={CacheLayer} due to an exception. This will result in cache misses on this layer.", cacheKey, layer.GetType());
 			}
+
+			if (expectedGeneration.HasValue && KeyLock.HasGenerationChanged(cacheKey, writeGeneration))
+			{
+				await EvictInternalAsync(cacheKey).ConfigureAwait(false);
+				return false;
+			}
 		}
 
 		await Extensions.OnCacheUpdateAsync(cacheKey, cacheEntry.Expiry, cacheUpdateType).ConfigureAwait(false);
+		return true;
 	}
 
 	/// <inheritdoc/>

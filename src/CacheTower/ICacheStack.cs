@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace CacheTower
@@ -84,7 +85,24 @@ namespace CacheTower
 		/// <param name="valueFactory">The value factory called when no cache entry is available.</param>
 		/// <param name="settings">Cache control settings.</param>
 		/// <returns>The item from the cache that corresponds to the given <paramref name="cacheKey"/>.</returns>
-		ValueTask<T> GetOrSetAsync<T>(string cacheKey, Func<T, Task<T>> valueFactory, CacheSettings settings);
+	ValueTask<T> GetOrSetAsync<T>(string cacheKey, Func<T, Task<T>> valueFactory, CacheSettings settings);
+	/// <summary>
+	/// Attempts to retrieve the value for the given <paramref name="cacheKey"/>, optionally using stale-while-revalidate, and provides a receipt describing the value's source.
+	/// </summary>
+	/// <typeparam name="T">The type of value in the cache entry.</typeparam>
+	/// <param name="cacheKey">The cache entry's key.</param>
+	/// <param name="valueFactory">The value factory called when no cache entry is available.</param>
+	/// <param name="settings">Cache control settings.</param>
+	/// <param name="readOptions">Optional read strategy. The default preserves normal cache behaviour.</param>
+	/// <param name="cancellationToken">Cancels waiting for a foreground refresh but does not cancel a refresh shared by another read.</param>
+	/// <returns>The item from the cache and a receipt describing its source.</returns>
+	ValueTask<CacheReadResult<T>> GetOrSetAsync<T>(
+		string cacheKey,
+		Func<T, Task<T>> valueFactory,
+		CacheSettings settings,
+		CacheReadOptions readOptions,
+		CancellationToken cancellationToken = default
+	);
 	}
 
 	/// <remarks>
@@ -135,6 +153,14 @@ namespace CacheTower
 		/// Additionally provides access to a context object during refreshing, allowing easier access to inject dependencies.
 		/// </remarks>
 		/// <inheritdoc cref="ICacheStack.GetOrSetAsync{T}(string, Func{T, Task{T}}, CacheSettings)"/>
-		ValueTask<T> GetOrSetAsync<T>(string cacheKey, Func<T, TContext, Task<T>> valueFactory, CacheSettings settings);
-	}
+	ValueTask<T> GetOrSetAsync<T>(string cacheKey, Func<T, TContext, Task<T>> valueFactory, CacheSettings settings);
+	/// <inheritdoc cref="ICacheStack.GetOrSetAsync{T}(string, Func{T, Task{T}}, CacheSettings, CacheReadOptions, CancellationToken)"/>
+	ValueTask<CacheReadResult<T>> GetOrSetAsync<T>(
+		string cacheKey,
+		Func<T, TContext, Task<T>> valueFactory,
+		CacheSettings settings,
+		CacheReadOptions readOptions,
+		CancellationToken cancellationToken = default
+	);
+}
 }
