@@ -1,13 +1,28 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace CacheTower.Internal;
 
 internal readonly struct CacheEntryKeyLock
 {
-	private readonly Dictionary<string, TaskCompletionSource<ICacheEntry>?> keyLocks = new(StringComparer.Ordinal);
+	private sealed class LockWaiters
+	{
+		public readonly List<Waiter> Waiters = new();
+	}
+
+	private sealed class Waiter : TaskCompletionSource<ICacheEntry>
+	{
+		public CancellationTokenRegistration Registration;
+
+		public Waiter() : base(TaskCreationOptions.RunContinuationsAsynchronously)
+		{
+		}
+	}
+
+	private readonly Dictionary<string, LockWaiters> keyLocks = new(StringComparer.Ordinal);
 
 	public CacheEntryKeyLock() { }
 
@@ -19,62 +34,98 @@ internal readonly struct CacheEntryKeyLock
 			var hasLock = !keyLocks.ContainsKey(cacheKey);
 			if (hasLock)
 			{
-				keyLocks[cacheKey] = null;
+				keyLocks[cacheKey] = new LockWaiters();
 			}
 			return hasLock;
 #elif NETSTANDARD2_1
-			return keyLocks.TryAdd(cacheKey, null);
+			return keyLocks.TryAdd(cacheKey, new LockWaiters());
 #endif
 		}
 	}
 
-	public Task<ICacheEntry> WaitAsync(string cacheKey)
+	public Task<ICacheEntry> WaitAsync(string cacheKey, CancellationToken cancellationToken = default)
 	{
-		TaskCompletionSource<ICacheEntry>? completionSource;
+		var waiter = new Waiter();
+
+		if (cancellationToken.IsCancellationRequested)
+		{
+			waiter.TrySetCanceled(cancellationToken);
+			return waiter.Task;
+		}
 
 		lock (keyLocks)
 		{
-			if (!keyLocks.TryGetValue(cacheKey, out completionSource) || completionSource == null)
+			if (!keyLocks.TryGetValue(cacheKey, out var lockWaiters))
 			{
-				completionSource = new TaskCompletionSource<ICacheEntry>();
-				keyLocks[cacheKey] = completionSource;
+				waiter.TrySetCanceled(CancellationToken.None);
+				return waiter.Task;
 			}
+
+			waiter.Registration = cancellationToken.Register(state =>
+			{
+				var canceledWaiter = (Waiter)state!;
+				if (canceledWaiter.TrySetCanceled(CancellationToken.None))
+				{
+					RemoveWaiter(cacheKey, canceledWaiter);
+				}
+			}, waiter);
+
+			lockWaiters.Waiters.Add(waiter);
 		}
 
-		return completionSource.Task;
+		return waiter.Task;
+	}
+
+	private void RemoveWaiter(string cacheKey, Waiter waiter)
+	{
+		lock (keyLocks)
+		{
+			if (keyLocks.TryGetValue(cacheKey, out var lockWaiters))
+			{
+				lockWaiters.Waiters.Remove(waiter);
+			}
+		}
 	}
 
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	private bool TryRemove(string cacheKey, out TaskCompletionSource<ICacheEntry>? completionSource)
+	private bool TryRemove(string cacheKey, out LockWaiters? lockWaiters)
 	{
 		lock (keyLocks)
 		{
 #if NETSTANDARD2_0
-			if (keyLocks.TryGetValue(cacheKey, out completionSource))
+			if (keyLocks.TryGetValue(cacheKey, out lockWaiters))
 			{
 				keyLocks.Remove(cacheKey);
 				return true;
 			}
 			return false;
 #elif NETSTANDARD2_1
-			return keyLocks.Remove(cacheKey, out completionSource);
+			return keyLocks.Remove(cacheKey, out lockWaiters);
 #endif
 		}
 	}
 
 	public void ReleaseLock(string cacheKey, ICacheEntry cacheEntry)
 	{
-		if (TryRemove(cacheKey, out var completionSource))
+		if (TryRemove(cacheKey, out var lockWaiters))
 		{
-			completionSource?.TrySetResult(cacheEntry);
+			foreach (var waiter in lockWaiters!.Waiters)
+			{
+				waiter.Registration.Dispose();
+				waiter.TrySetResult(cacheEntry);
+			}
 		}
 	}
 
 	public void ReleaseLock(string cacheKey, Exception exception)
 	{
-		if (TryRemove(cacheKey, out var completionSource))
+		if (TryRemove(cacheKey, out var lockWaiters))
 		{
-			completionSource?.SetException(exception);
+			foreach (var waiter in lockWaiters!.Waiters)
+			{
+				waiter.Registration.Dispose();
+				waiter.TrySetException(exception);
+			}
 		}
 	}
 }
