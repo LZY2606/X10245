@@ -18,6 +18,13 @@ namespace CacheTower
 		/// While optional, the cache will not perform a background refresh if <see cref="StaleAfter"/> is not set.
 		/// </remarks>
 		public TimeSpan? StaleAfter { get; }
+		/// <summary>
+		/// How long after expiry a cache entry can still be served while a refresh happens in the background.
+		/// </summary>
+		/// <remarks>
+		/// This is an opt-in stale-while-revalidate read strategy. When <see langword="null"/>, expired entries are never returned and the default policy is unchanged.
+		/// </remarks>
+		public TimeSpan? StaleWhileRevalidateWindow { get; }
 
 		/// <summary>
 		/// Configures the cache entry to have a life of <paramref name="timeToLive"/>.
@@ -30,6 +37,7 @@ namespace CacheTower
 		{
 			TimeToLive = timeToLive;
 			StaleAfter = null;
+			StaleWhileRevalidateWindow = null;
 		}
 
 		/// <summary>
@@ -55,6 +63,38 @@ namespace CacheTower
 		{
 			TimeToLive = timeToLive;
 			StaleAfter = staleAfter;
+			StaleWhileRevalidateWindow = null;
+		}
+
+		/// <summary>
+		/// Configures the cache entry to have a life of <paramref name="timeToLive"/>, to be considered stale after <paramref name="staleAfter"/>
+		/// and to opt-in to the stale-while-revalidate read strategy with the given <paramref name="staleWhileRevalidateWindow"/>.
+		/// </summary>
+		/// <remarks>
+		/// When a cache entry is expired but still within <see cref="CacheEntry{T}.Expiry"/> + <paramref name="staleWhileRevalidateWindow"/>,
+		/// the expired value may be returned while a single background refresh is triggered for that key.
+		/// A failed refresh does not extend this window; it is always measured from the original expiry.
+		/// </remarks>
+		/// <param name="timeToLive">
+		/// How long till a cache entry is considered expired.
+		/// </param>
+		/// <param name="staleAfter">
+		/// How long till a cache entry is considered stale.
+		/// </param>
+		/// <param name="staleWhileRevalidateWindow">
+		/// How long after expiry the expired value can still be served while a background refresh happens. Must be positive.
+		/// </param>
+		/// <exception cref="ArgumentOutOfRangeException"></exception>
+		public CacheSettings(TimeSpan timeToLive, TimeSpan staleAfter, TimeSpan staleWhileRevalidateWindow)
+		{
+			if (staleWhileRevalidateWindow <= TimeSpan.Zero)
+			{
+				throw new ArgumentOutOfRangeException(nameof(staleWhileRevalidateWindow), "The stale-while-revalidate window must be a positive timespan.");
+			}
+
+			TimeToLive = timeToLive;
+			StaleAfter = staleAfter;
+			StaleWhileRevalidateWindow = staleWhileRevalidateWindow;
 		}
 	}
 }
