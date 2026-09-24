@@ -6,6 +6,8 @@ namespace CacheTower.Internal
 {
 	internal static class DateTimeProvider
 	{
+		private static bool IsFrozen;
+
 		/// <summary>
 		/// The current <see cref="DateTime.UtcNow"/>, updated every second.
 		/// </summary>
@@ -21,7 +23,27 @@ namespace CacheTower.Internal
 		/// The alternative for the tests is just "waiting" an extra second between setting a value and retrieving it however that makes the testing slower and the tests more confusing.
 		/// </remarks>
 		[MethodImpl(MethodImplOptions.AggressiveInlining)]
-		public static void UpdateTime() => Now = DateTime.UtcNow;
+		public static void UpdateTime()
+		{
+			if (!IsFrozen)
+			{
+				Now = DateTime.UtcNow;
+			}
+		}
+
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
+		internal static void Freeze(DateTime now)
+		{
+			IsFrozen = true;
+			Now = now.ToUniversalTime();
+		}
+
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
+		internal static void Reset()
+		{
+			IsFrozen = false;
+			Now = DateTime.UtcNow;
+		}
 
 		[System.Diagnostics.CodeAnalysis.SuppressMessage("CodeQuality", "IDE0052:Remove unread private members", Justification = "Establishes timer and prevents it being garbage collected")]
 		private static readonly Timer DateTimeTimer = new(state => UpdateTime(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));

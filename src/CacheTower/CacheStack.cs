@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 using CacheTower.Extensions;
 using CacheTower.Internal;
@@ -103,6 +104,8 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 	{
 		ThrowIfDisposed();
 
+		var evictionLease = await KeyLock.AcquireEvictionAsync(cacheKey).ConfigureAwait(false);
+
 		for (int i = 0, l = CacheLayers.Length; i < l; i++)
 		{
 			var layer = CacheLayers[i];
@@ -139,6 +142,8 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 			var layer = CacheLayers[i];
 			await layer.EvictAsync(cacheKey).ConfigureAwait(false);
 		}
+
+		KeyLock.ReleaseEviction(evictionLease);
 
 		await Extensions.OnCacheEvictionAsync(cacheKey).ConfigureAwait(false);
 	}
@@ -288,6 +293,24 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 	/// <inheritdoc/>
 	public async ValueTask<T> GetOrSetAsync<T>(string cacheKey, Func<T, Task<T>> valueFactory, CacheSettings settings)
 	{
+		var result = await GetOrSetCoreAsync(cacheKey, valueFactory, new CacheReadOptions(settings), CacheEntryStatus.Stale, null).ConfigureAwait(false);
+		return result.Value!;
+	}
+
+	/// <inheritdoc/>
+	public ValueTask<CacheReadResult<T>> GetOrSetAsync<T>(string cacheKey, Func<T, Task<T>> valueFactory, CacheReadOptions options)
+	{
+		return GetOrSetCoreAsync(cacheKey, valueFactory, options, CacheEntryStatus.Stale, null);
+	}
+
+	private async ValueTask<CacheReadResult<T>> GetOrSetCoreAsync<T>(
+		string cacheKey,
+		Func<T, Task<T>> valueFactory,
+		CacheReadOptions options,
+		CacheEntryStatus backgroundStatus,
+		CacheEntry<T>? backgroundEntry
+	)
+	{
 		ThrowIfDisposed();
 
 		if (cacheKey == null)
@@ -300,78 +323,106 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 			throw new ArgumentNullException(nameof(valueFactory));
 		}
 
+		var settings = options.Settings;
+		var cancellationToken = options.CancellationToken;
+		cancellationToken.ThrowIfCancellationRequested();
+
 		var currentTime = DateTimeProvider.Now;
-		var cacheEntryPoint = await GetWithLayerIndexAsync<T>(cacheKey).ConfigureAwait(false);
+		var cacheEntryPoint = backgroundEntry is null
+			? await GetWithLayerIndexAsync<T>(cacheKey).ConfigureAwait(false)
+			: (0, backgroundEntry);
 		var cacheEntryStatus = CacheEntryStatus.Stale;
+
 		if (cacheEntryPoint != default)
 		{
-			if (cacheEntryPoint.CacheEntry.Expiry > currentTime)
+			var cacheEntry = cacheEntryPoint.CacheEntry;
+			if (cacheEntry.Expiry > currentTime)
 			{
-				var cacheEntry = cacheEntryPoint.CacheEntry;
-				if (settings.StaleAfter.HasValue && cacheEntry.GetStaleDate(settings) < currentTime)
+				var freshness = settings.StaleAfter.HasValue && cacheEntry.GetStaleDate(settings) <= currentTime
+					? CacheReadFreshness.Stale
+					: CacheReadFreshness.Fresh;
+
+				if (freshness == CacheReadFreshness.Stale)
 				{
-					//If the cache entry is stale, refresh the value in the background
-					_ = RefreshValueAsync(cacheKey, valueFactory, settings, cacheEntryStatus);
+					_ = RefreshValueAsync(cacheKey, valueFactory, options, backgroundStatus, cacheEntry);
 				}
 				else if (cacheEntryPoint.LayerIndex > 0)
 				{
-					//If a lower-level cache is missing the latest data, attempt to set it in the background
 					_ = BackPopulateCacheAsync(cacheEntryPoint.LayerIndex, cacheKey, cacheEntry);
 				}
 
-				return cacheEntry.Value!;
+				return new(cacheEntry.Value, CacheReadReceipt.FromLayer(cacheEntryPoint.LayerIndex, freshness));
 			}
-			else
+
+			var staleWindowEndsAt = cacheEntry.Expiry + options.StaleWhileRevalidateWindow;
+			if (options.Mode == CacheReadMode.StaleWhileRevalidate && staleWindowEndsAt >= currentTime)
 			{
-				//Refresh the value in the current thread because we only have expired data (we never return expired data)
-				cacheEntryStatus = CacheEntryStatus.Expired;
+				_ = RefreshValueAsync(cacheKey, valueFactory, options, CacheEntryStatus.Expired, cacheEntry);
+				return new(cacheEntry.Value, CacheReadReceipt.FromLayer(cacheEntryPoint.LayerIndex, CacheReadFreshness.Stale));
 			}
+
+			cacheEntryStatus = CacheEntryStatus.Expired;
 		}
 		else
 		{
-			//Refresh the value in the current thread because we have no existing data
 			cacheEntryStatus = CacheEntryStatus.Miss;
 		}
 
-		return (await RefreshValueAsync(cacheKey, valueFactory, settings, cacheEntryStatus).ConfigureAwait(false))!.Value!;
+		var refreshed = await RefreshValueAsync(cacheKey, valueFactory, options, cacheEntryStatus, null).ConfigureAwait(false);
+		return new(refreshed!.Value, CacheReadReceipt.FromFactory());
 	}
 
 	private async ValueTask BackPopulateCacheAsync<T>(int fromIndexExclusive, string cacheKey, CacheEntry<T> cacheEntry)
 	{
-		if (KeyLock.AcquireLock(cacheKey))
+		var evictionLease = await KeyLock.AcquireEvictionAsync(cacheKey).ConfigureAwait(false);
+		try
 		{
-			try
+			for (; --fromIndexExclusive >= 0;)
 			{
-				for (; --fromIndexExclusive >= 0;)
+				var previousLayer = CacheLayers[fromIndexExclusive];
+				if (await previousLayer.IsAvailableAsync(cacheKey).ConfigureAwait(false))
 				{
-					var previousLayer = CacheLayers[fromIndexExclusive];
-					if (await previousLayer.IsAvailableAsync(cacheKey).ConfigureAwait(false))
-					{
-						await previousLayer.SetAsync(cacheKey, cacheEntry).ConfigureAwait(false);
-					}
+					await previousLayer.SetAsync(cacheKey, cacheEntry).ConfigureAwait(false);
 				}
 			}
-			finally
-			{
-				KeyLock.ReleaseLock(cacheKey, cacheEntry);
-			}
+		}
+		finally
+		{
+			KeyLock.ReleaseEviction(evictionLease);
 		}
 	}
 
-	private async ValueTask<CacheEntry<T>?> RefreshValueAsync<T>(string cacheKey, Func<T, Task<T>> asyncValueFactory, CacheSettings settings, CacheEntryStatus entryStatus)
+	private static async Task<TResult> WaitAsync<TResult>(Task<TResult> task, CancellationToken cancellationToken)
 	{
-		if (KeyLock.AcquireLock(cacheKey))
+		if (!cancellationToken.CanBeCanceled)
 		{
+			return await task.ConfigureAwait(false);
+		}
+
+		var completionSource = new TaskCompletionSource<TResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+		using var registration = cancellationToken.Register(state => ((TaskCompletionSource<TResult>)state!).TrySetCanceled(), completionSource);
+		var completedTask = await Task.WhenAny(task, completionSource.Task).ConfigureAwait(false);
+		return await completedTask.ConfigureAwait(false);
+	}
+
+	private async ValueTask<CacheEntry<T>?> RefreshValueAsync<T>(
+		string cacheKey,
+		Func<T, Task<T>> asyncValueFactory,
+		CacheReadOptions options,
+		CacheEntryStatus entryStatus,
+		CacheEntry<T>? knownEntry
+	)
+	{
+		var refreshLease = await KeyLock.TryBeginRefreshAsync(cacheKey).ConfigureAwait(false);
+		if (refreshLease is not null)
+		{
+			var lease = refreshLease.GetValueOrDefault();
 			try
 			{
-				var previousEntry = await GetAsync<T>(cacheKey).ConfigureAwait(false);
+				var previousEntry = knownEntry ?? await GetAsync<T>(cacheKey).ConfigureAwait(false);
 				if (previousEntry != default && entryStatus == CacheEntryStatus.Miss && previousEntry.Expiry >= DateTimeProvider.Now)
 				{
-					//The Cache Stack will always return an unexpired value if one exists.
-					//If we are told to refresh because one doesn't and we find one, we return the existing value, ignoring the refresh.
-					//This can happen due to the race condition of getting the values out of the cache.
-					//We can only do any of this because we have the local lock.
-					KeyLock.ReleaseLock(cacheKey, previousEntry);
+					KeyLock.CompleteRefresh(lease, previousEntry);
 					return previousEntry;
 				}
 
@@ -382,44 +433,68 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 				{
 					var oldValue = previousEntry != default ? previousEntry.Value : default;
 					var refreshedValue = await asyncValueFactory(oldValue!).ConfigureAwait(false);
-					cacheEntry = new CacheEntry<T>(refreshedValue, settings.TimeToLive);
-					var cacheUpdateType = entryStatus switch
+					cacheEntry = new CacheEntry<T>(refreshedValue, options.Settings.TimeToLive);
+					if (!KeyLock.TryCommitRefresh(lease, cacheEntry))
 					{
-						CacheEntryStatus.Miss => CacheUpdateType.AddEntry,
-						_ => CacheUpdateType.AddOrUpdateEntry
-					};
-					await InternalSetAsync(cacheKey, cacheEntry, cacheUpdateType).ConfigureAwait(false);
+						KeyLock.CancelRefresh(lease);
+						return null;
+					}
 
-					KeyLock.ReleaseLock(cacheKey, cacheEntry);
+					var cacheUpdateType = entryStatus == CacheEntryStatus.Miss
+						? CacheUpdateType.AddEntry
+						: CacheUpdateType.AddOrUpdateEntry;
+					try
+					{
+						await InternalSetAsync(cacheKey, cacheEntry, cacheUpdateType).ConfigureAwait(false);
+					}
+					finally
+					{
+						KeyLock.ReleaseRefreshGate(lease, cacheEntry);
+					}
 				}
 				else
 				{
 					cacheEntry = await GetAsync<T>(cacheKey).ConfigureAwait(false);
+					if (cacheEntry == default)
+					{
+						throw new InvalidOperationException("Cache entry not found after distributed refresh.");
+					}
 				}
 
+				KeyLock.CompleteRefresh(lease, cacheEntry);
 				return cacheEntry;
 			}
 			catch (Exception e)
 			{
-				KeyLock.ReleaseLock(cacheKey, e);
+				KeyLock.FailRefresh(lease, e);
 				throw;
 			}
 		}
-		else if (entryStatus != CacheEntryStatus.Stale)
-		{
-			//Last minute check to confirm whether waiting is required
-			var currentEntry = await GetAsync<T>(cacheKey).ConfigureAwait(false);
-			if (currentEntry != null && currentEntry.GetStaleDate(settings) > DateTimeProvider.Now)
-			{
-				KeyLock.ReleaseLock(cacheKey, currentEntry);
-				return currentEntry;
-			}
 
-			//Lock until we are notified to be unlocked
-			return await KeyLock.WaitAsync(cacheKey).ConfigureAwait(false) as CacheEntry<T>;
+		if (entryStatus == CacheEntryStatus.Stale)
+		{
+			return default;
 		}
 
-		return default;
+		var waitTask = KeyLock.RegisterWaiter(cacheKey);
+		ICacheEntry awaitedEntry;
+		try
+		{
+			awaitedEntry = await WaitAsync(waitTask, options.CancellationToken).ConfigureAwait(false);
+		}
+		catch
+		{
+			KeyLock.ReleaseWaiter(cacheKey);
+			throw;
+		}
+
+		if (awaitedEntry is not CacheEntry<T> typedEntry)
+		{
+			KeyLock.ReleaseWaiter(cacheKey);
+			throw new InvalidOperationException("Cache refresh completed with an incompatible entry type.");
+		}
+
+		return typedEntry;
 	}
 
 	/// <summary>

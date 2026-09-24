@@ -1,80 +1,239 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
-using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace CacheTower.Internal;
 
-internal readonly struct CacheEntryKeyLock
+internal sealed class CacheEntryKeyLock
 {
-	private readonly Dictionary<string, TaskCompletionSource<ICacheEntry>?> keyLocks = new(StringComparer.Ordinal);
+	private sealed class KeyState
+	{
+		public bool IsRefreshRunning;
+		public int EvictionGeneration;
+		public TaskCompletionSource<ICacheEntry>? RefreshCompletion;
+		public SemaphoreSlim? Gate;
+		public int OperationCount;
+	}
 
-	public CacheEntryKeyLock() { }
+	private readonly Dictionary<string, KeyState> keyLocks = new(StringComparer.Ordinal);
 
-	public bool AcquireLock(string cacheKey)
+	public async Task<CacheRefreshLease?> TryBeginRefreshAsync(string cacheKey)
+	{
+		SemaphoreSlim gate;
+		int generation;
+
+		lock (keyLocks)
+		{
+			if (!keyLocks.TryGetValue(cacheKey, out var state))
+			{
+				state = new KeyState();
+				keyLocks[cacheKey] = state;
+			}
+
+			if (state.IsRefreshRunning)
+			{
+				return null;
+			}
+
+			state.IsRefreshRunning = true;
+			state.OperationCount++;
+			generation = state.EvictionGeneration;
+			gate = state.Gate ??= new SemaphoreSlim(1, 1);
+		}
+
+		await gate.WaitAsync().ConfigureAwait(false);
+		return new(cacheKey, generation, gate);
+	}
+
+	public Task<ICacheEntry> RegisterWaiter(string cacheKey)
 	{
 		lock (keyLocks)
 		{
-#if NETSTANDARD2_0
-			var hasLock = !keyLocks.ContainsKey(cacheKey);
-			if (hasLock)
+			if (!keyLocks.TryGetValue(cacheKey, out var state) || !state.IsRefreshRunning)
 			{
-				keyLocks[cacheKey] = null;
+				throw new InvalidOperationException("No refresh is running for the cache key.");
 			}
-			return hasLock;
-#elif NETSTANDARD2_1
-			return keyLocks.TryAdd(cacheKey, null);
-#endif
+
+			state.RefreshCompletion ??= new(TaskCreationOptions.RunContinuationsAsynchronously);
+			state.OperationCount++;
+			return state.RefreshCompletion.Task;
 		}
 	}
 
-	public Task<ICacheEntry> WaitAsync(string cacheKey)
+	public void ReleaseWaiter(string cacheKey)
+	{
+		lock (keyLocks)
+		{
+			if (keyLocks.TryGetValue(cacheKey, out var state))
+			{
+				RemoveOperation(state, cacheKey);
+			}
+		}
+	}
+
+	public bool TryCommitRefresh(CacheRefreshLease lease, ICacheEntry cacheEntry)
+	{
+		lock (keyLocks)
+		{
+			if (!keyLocks.TryGetValue(lease.CacheKey, out var state) ||
+				!state.IsRefreshRunning ||
+				state.EvictionGeneration != lease.EvictionGeneration)
+			{
+				return false;
+			}
+
+			return true;
+		}
+	}
+
+	public void ReleaseRefreshGate(CacheRefreshLease lease, ICacheEntry cacheEntry)
 	{
 		TaskCompletionSource<ICacheEntry>? completionSource;
 
 		lock (keyLocks)
 		{
-			if (!keyLocks.TryGetValue(cacheKey, out completionSource) || completionSource == null)
+			if (!keyLocks.TryGetValue(lease.CacheKey, out var state) || !state.IsRefreshRunning)
 			{
-				completionSource = new TaskCompletionSource<ICacheEntry>();
-				keyLocks[cacheKey] = completionSource;
+				lease.Gate.Release();
+				return;
 			}
+
+			completionSource = state.RefreshCompletion;
+			state.IsRefreshRunning = false;
+			state.RefreshCompletion = null;
+			RemoveOperation(state, lease.CacheKey);
 		}
 
-		return completionSource.Task;
+		lease.Gate.Release();
+		completionSource?.TrySetResult(cacheEntry);
 	}
 
-	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	private bool TryRemove(string cacheKey, out TaskCompletionSource<ICacheEntry>? completionSource)
+	public void CancelRefresh(CacheRefreshLease lease)
+	{
+		TaskCompletionSource<ICacheEntry>? completionSource;
+
+		lock (keyLocks)
+		{
+			if (!keyLocks.TryGetValue(lease.CacheKey, out var state) || !state.IsRefreshRunning)
+			{
+				lease.Gate.Release();
+				return;
+			}
+
+			completionSource = state.RefreshCompletion;
+			state.IsRefreshRunning = false;
+			state.RefreshCompletion = null;
+			RemoveOperation(state, lease.CacheKey);
+		}
+
+		lease.Gate.Release();
+		completionSource?.TrySetCanceled();
+	}
+
+	public void CompleteRefresh(CacheRefreshLease lease, ICacheEntry cacheEntry)
+	{
+		if (TryCommitRefresh(lease, cacheEntry))
+		{
+			ReleaseRefreshGate(lease, cacheEntry);
+		}
+	}
+
+	public void FailRefresh(CacheRefreshLease lease, Exception exception)
+	{
+		TaskCompletionSource<ICacheEntry>? completionSource;
+
+		lock (keyLocks)
+		{
+			if (!keyLocks.TryGetValue(lease.CacheKey, out var state) || !state.IsRefreshRunning)
+			{
+				lease.Gate.Release();
+				return;
+			}
+
+			completionSource = state.RefreshCompletion;
+			state.IsRefreshRunning = false;
+			state.RefreshCompletion = null;
+			RemoveOperation(state, lease.CacheKey);
+		}
+
+		lease.Gate.Release();
+		completionSource?.TrySetException(exception);
+	}
+
+	public async Task<CacheEvictionLease> AcquireEvictionAsync(string cacheKey)
+	{
+		SemaphoreSlim gate;
+		int generation;
+
+		lock (keyLocks)
+		{
+			if (!keyLocks.TryGetValue(cacheKey, out var state))
+			{
+				state = new KeyState();
+				keyLocks[cacheKey] = state;
+			}
+
+			generation = ++state.EvictionGeneration;
+			gate = state.Gate ??= new SemaphoreSlim(1, 1);
+			state.OperationCount++;
+		}
+
+		await gate.WaitAsync().ConfigureAwait(false);
+		return new(cacheKey, gate, generation);
+	}
+
+	public void ReleaseEviction(CacheEvictionLease lease)
 	{
 		lock (keyLocks)
 		{
-#if NETSTANDARD2_0
-			if (keyLocks.TryGetValue(cacheKey, out completionSource))
+			if (keyLocks.TryGetValue(lease.CacheKey, out var state))
 			{
-				keyLocks.Remove(cacheKey);
-				return true;
+				lease.Gate.Release();
+				RemoveOperation(state, lease.CacheKey);
 			}
-			return false;
-#elif NETSTANDARD2_1
-			return keyLocks.Remove(cacheKey, out completionSource);
-#endif
+			else
+			{
+				lease.Gate.Release();
+			}
 		}
 	}
 
-	public void ReleaseLock(string cacheKey, ICacheEntry cacheEntry)
+	private void RemoveOperation(KeyState state, string cacheKey)
 	{
-		if (TryRemove(cacheKey, out var completionSource))
+		state.OperationCount--;
+		if (state.OperationCount <= 0 && !state.IsRefreshRunning && state.RefreshCompletion is null)
 		{
-			completionSource?.TrySetResult(cacheEntry);
+			keyLocks.Remove(cacheKey);
+			state.Gate?.Dispose();
 		}
 	}
+}
 
-	public void ReleaseLock(string cacheKey, Exception exception)
+internal readonly struct CacheRefreshLease
+{
+	public string CacheKey { get; }
+	public int EvictionGeneration { get; }
+	public SemaphoreSlim Gate { get; }
+
+	public CacheRefreshLease(string cacheKey, int evictionGeneration, SemaphoreSlim gate)
 	{
-		if (TryRemove(cacheKey, out var completionSource))
-		{
-			completionSource?.SetException(exception);
-		}
+		CacheKey = cacheKey;
+		EvictionGeneration = evictionGeneration;
+		Gate = gate;
+	}
+}
+
+internal readonly struct CacheEvictionLease
+{
+	public string CacheKey { get; }
+	public SemaphoreSlim Gate { get; }
+	public int Generation { get; }
+
+	public CacheEvictionLease(string cacheKey, SemaphoreSlim gate, int generation)
+	{
+		CacheKey = cacheKey;
+		Gate = gate;
+		Generation = generation;
 	}
 }
