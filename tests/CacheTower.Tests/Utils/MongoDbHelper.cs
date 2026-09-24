@@ -11,6 +11,29 @@ namespace CacheTower.Tests.Utils
 	{
 		public static string ConnectionString => Environment.GetEnvironmentVariable("MONGODB_URI") ?? "mongodb://localhost";
 
+		private static readonly Lazy<bool> Available = new(() =>
+		{
+			try
+			{
+				var settings = MongoClientSettings.FromConnectionString(ConnectionString);
+				settings.ServerSelectionTimeout = TimeSpan.FromSeconds(3);
+				var client = new MongoClient(settings);
+				using (client.ListDatabaseNames())
+				{
+					return true;
+				}
+			}
+			catch
+			{
+				return false;
+			}
+		});
+
+		/// <summary>
+		/// Whether a MongoDB server is reachable at <see cref="ConnectionString"/>. Used to skip integration tests when no server is available.
+		/// </summary>
+		public static bool IsAvailable => Available.Value;
+
 		public static string GetDatabaseName()
 		{
 			return "CacheTowerTests";

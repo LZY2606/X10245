@@ -15,6 +15,11 @@ namespace CacheTower.Tests.Providers.Redis
 		[TestInitialize]
 		public void Setup()
 		{
+			if (!RedisHelper.IsAvailable)
+			{
+				Assert.Inconclusive($"Redis is not available at {RedisHelper.Endpoint}");
+			}
+
 			RedisHelper.ResetState();
 		}
 

@@ -29,13 +29,31 @@ public static class RedisHelper
 
 	private static ConnectionMultiplexer Connection { get; set; }
 
+	private static readonly Lazy<bool> Available = new(() =>
+	{
+		try
+		{
+			return GetConnection().GetDatabase().PingAsync().Wait(TimeSpan.FromSeconds(10));
+		}
+		catch
+		{
+			return false;
+		}
+	});
+
+	/// <summary>
+	/// Whether a Redis server is reachable at <see cref="Endpoint"/>. Used to skip integration tests when no server is available.
+	/// </summary>
+	public static bool IsAvailable => Available.Value;
+
 	public static ConnectionMultiplexer GetConnection()
 	{
 		if (Connection == null)
 		{
 			var config = new ConfigurationOptions
 			{
-				AllowAdmin = true
+				AllowAdmin = true,
+				AbortOnConnectFail = false
 			};
 			config.EndPoints.Add(Endpoint);
 			Connection = ConnectionMultiplexer.Connect(config);
