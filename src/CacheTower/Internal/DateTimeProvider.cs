@@ -23,6 +23,17 @@ namespace CacheTower.Internal
 		[MethodImpl(MethodImplOptions.AggressiveInlining)]
 		public static void UpdateTime() => Now = DateTime.UtcNow;
 
+		/// <summary>
+		/// Pins <see cref="Now"/> to an explicit UTC <paramref name="dateTime"/>, acting as a fake clock.
+		/// </summary>
+		/// <remarks>
+		/// This is intended only for tests that need deterministic control over stale/expiry windows and is not part of the production API.
+		/// The internal timer may overwrite it with the real wall clock afterwards; call <see cref="UpdateTime"/> or this method again to re-pin it.
+		/// A value with <see cref="DateTime.Kind"/> other than <see cref="DateTimeKind.Utc"/> is converted from local time.
+		/// </remarks>
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
+		internal static void SetTime(DateTime dateTime) => Now = dateTime.Kind == DateTimeKind.Utc ? dateTime : dateTime.ToUniversalTime();
+
 		[System.Diagnostics.CodeAnalysis.SuppressMessage("CodeQuality", "IDE0052:Remove unread private members", Justification = "Establishes timer and prevents it being garbage collected")]
 		private static readonly Timer DateTimeTimer = new(state => UpdateTime(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
 	}

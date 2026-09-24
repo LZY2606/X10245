@@ -1,9 +1,27 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 
 namespace CacheTower.Internal;
+
+/// <summary>
+/// Notification released when a key's refresh completes.
+/// Wraps the cache entry with refresh metadata that waiting callers need to build a correct source receipt.
+/// </summary>
+internal sealed class RefreshResultEntry<T> : ICacheEntry
+{
+	public RefreshResultEntry(CacheEntry<T> cacheEntry, bool servedFromFactory)
+	{
+		CacheEntry = cacheEntry;
+		ServedFromFactory = servedFromFactory;
+	}
+
+	public CacheEntry<T> CacheEntry { get; }
+	public bool ServedFromFactory { get; }
+
+	public DateTime Expiry => CacheEntry.Expiry;
+}
 
 internal readonly struct CacheEntryKeyLock
 {
@@ -25,6 +43,21 @@ internal readonly struct CacheEntryKeyLock
 #elif NETSTANDARD2_1
 			return keyLocks.TryAdd(cacheKey, null);
 #endif
+		}
+	}
+
+	/// <summary>
+	/// The number of keys that currently have an in-flight refresh or waiters.
+	/// Intended for internal diagnostics and tests verifying single-flight state is cleaned up.
+	/// </summary>
+	public int ActiveRefreshCount
+	{
+		get
+		{
+			lock (keyLocks)
+			{
+				return keyLocks.Count;
+			}
 		}
 	}
 
