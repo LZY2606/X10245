@@ -11,6 +11,8 @@ namespace CacheTower.Internal
 		/// </summary>
 		public static DateTime Now { get; private set; } = DateTime.UtcNow;
 
+		private static bool IsManualTime;
+
 		/// <summary>
 		/// Updates <see cref="Now"/> to the current <see cref="DateTime.UtcNow"/> value. This is automatically called by a timer every second.
 		/// </summary>
@@ -21,7 +23,27 @@ namespace CacheTower.Internal
 		/// The alternative for the tests is just "waiting" an extra second between setting a value and retrieving it however that makes the testing slower and the tests more confusing.
 		/// </remarks>
 		[MethodImpl(MethodImplOptions.AggressiveInlining)]
-		public static void UpdateTime() => Now = DateTime.UtcNow;
+		public static void UpdateTime()
+		{
+			if (!IsManualTime)
+			{
+				Now = DateTime.UtcNow;
+			}
+		}
+
+		internal static void SetTime(DateTime value)
+		{
+			IsManualTime = true;
+			Now = new DateTime(value.Year, value.Month, value.Day, value.Hour, value.Minute, value.Second, DateTimeKind.Utc);
+		}
+
+		internal static void Advance(TimeSpan value) => Now += value;
+
+		internal static void Reset()
+		{
+			IsManualTime = false;
+			Now = DateTime.UtcNow;
+		}
 
 		[System.Diagnostics.CodeAnalysis.SuppressMessage("CodeQuality", "IDE0052:Remove unread private members", Justification = "Establishes timer and prevents it being garbage collected")]
 		private static readonly Timer DateTimeTimer = new(state => UpdateTime(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
