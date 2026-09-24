@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 using CacheTower.Extensions;
 using CacheTower.Internal;
@@ -288,6 +289,13 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 	/// <inheritdoc/>
 	public async ValueTask<T> GetOrSetAsync<T>(string cacheKey, Func<T, Task<T>> valueFactory, CacheSettings settings)
 	{
+		var result = await GetOrSetWithReceiptAsync(cacheKey, valueFactory, settings, CancellationToken.None).ConfigureAwait(false);
+		return result.Value!;
+	}
+
+	/// <inheritdoc/>
+	public async ValueTask<CacheFetchResult<T>> GetOrSetWithReceiptAsync<T>(string cacheKey, Func<T, Task<T>> valueFactory, CacheSettings settings, CancellationToken cancellationToken = default)
+	{
 		ThrowIfDisposed();
 
 		if (cacheKey == null)
@@ -300,30 +308,44 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 			throw new ArgumentNullException(nameof(valueFactory));
 		}
 
+		cancellationToken.ThrowIfCancellationRequested();
+
 		var currentTime = DateTimeProvider.Now;
 		var cacheEntryPoint = await GetWithLayerIndexAsync<T>(cacheKey).ConfigureAwait(false);
 		var cacheEntryStatus = CacheEntryStatus.Stale;
 		if (cacheEntryPoint != default)
 		{
-			if (cacheEntryPoint.CacheEntry.Expiry > currentTime)
+			var cacheEntry = cacheEntryPoint.CacheEntry;
+			if (cacheEntry.Expiry > currentTime)
 			{
-				var cacheEntry = cacheEntryPoint.CacheEntry;
 				if (settings.StaleAfter.HasValue && cacheEntry.GetStaleDate(settings) < currentTime)
 				{
 					//If the cache entry is stale, refresh the value in the background
 					_ = RefreshValueAsync(cacheKey, valueFactory, settings, cacheEntryStatus);
+					return new CacheFetchResult<T>(cacheEntry.Value, GetSource(cacheEntryPoint.LayerIndex, isStale: true));
 				}
-				else if (cacheEntryPoint.LayerIndex > 0)
+				else
 				{
-					//If a lower-level cache is missing the latest data, attempt to set it in the background
-					_ = BackPopulateCacheAsync(cacheEntryPoint.LayerIndex, cacheKey, cacheEntry);
-				}
+					if (cacheEntryPoint.LayerIndex > 0)
+					{
+						//If a lower-level cache is missing the latest data, attempt to set it in the background
+						_ = BackPopulateCacheAsync(cacheEntryPoint.LayerIndex, cacheKey, cacheEntry);
+					}
 
-				return cacheEntry.Value!;
+					return new CacheFetchResult<T>(cacheEntry.Value, GetSource(cacheEntryPoint.LayerIndex, isStale: false));
+				}
+			}
+			else if (settings.StaleWhileRevalidateAfter.HasValue && cacheEntry.Expiry + settings.StaleWhileRevalidateAfter.Value > currentTime)
+			{
+				//The cache entry is expired but still inside the opt-in stale-while-revalidate window.
+				//Return the expired value and refresh it in the background - only one refresh per cache key happens at a time.
+				//The window is measured from the entry's original expiry, so a failed refresh never extends it.
+				_ = RefreshValueAsync(cacheKey, valueFactory, settings, cacheEntryStatus);
+				return new CacheFetchResult<T>(cacheEntry.Value, GetSource(cacheEntryPoint.LayerIndex, isStale: true));
 			}
 			else
 			{
-				//Refresh the value in the current thread because we only have expired data (we never return expired data)
+				//Refresh the value in the current thread because we only have expired data (we never return expired data unless opted-in above)
 				cacheEntryStatus = CacheEntryStatus.Expired;
 			}
 		}
@@ -333,13 +355,87 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 			cacheEntryStatus = CacheEntryStatus.Miss;
 		}
 
-		return (await RefreshValueAsync(cacheKey, valueFactory, settings, cacheEntryStatus).ConfigureAwait(false))!.Value!;
+		var refreshResult = await WaitForRefreshAsync(RefreshValueAsync(cacheKey, valueFactory, settings, cacheEntryStatus), cancellationToken).ConfigureAwait(false);
+		return refreshResult ?? throw new NullReferenceException("Unable to retrieve or refresh the cache entry.");
+	}
+
+	/// <summary>
+	/// Awaits the shared refresh, honouring the caller's <paramref name="cancellationToken"/> for the wait only.
+	/// The shared refresh itself is never cancelled - it continues in the background so other callers and the cache still receive the result.
+	/// </summary>
+	private static async ValueTask<CacheFetchResult<T>?> WaitForRefreshAsync<T>(ValueTask<CacheFetchResult<T>?> refresh, CancellationToken cancellationToken)
+	{
+		if (!cancellationToken.CanBeCanceled)
+		{
+			return await refresh.ConfigureAwait(false);
+		}
+
+		var refreshTask = refresh.AsTask();
+		var cancellationSource = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+		using (cancellationToken.Register(static state => ((TaskCompletionSource<object?>)state!).TrySetResult(null), cancellationSource))
+		{
+			var completedTask = await Task.WhenAny(refreshTask, cancellationSource.Task).ConfigureAwait(false);
+			if (completedTask != refreshTask)
+			{
+				throw new OperationCanceledException(cancellationToken);
+			}
+		}
+
+		return await refreshTask.ConfigureAwait(false);
+	}
+
+	/// <summary>
+	/// Resolves the source receipt for a cache entry served from the layer at <paramref name="layerIndex"/>.
+	/// Layers implementing <see cref="ILocalCacheLayer"/> are reported as the memory layer; all others as the fallback layer.
+	/// </summary>
+	private CacheValueSource GetSource(int layerIndex, bool isStale)
+	{
+		var isLocalLayer = CacheLayers[layerIndex] is ILocalCacheLayer;
+		return (isLocalLayer, isStale) switch
+		{
+			(true, false) => CacheValueSource.MemoryLayerFresh,
+			(true, true) => CacheValueSource.MemoryLayerStale,
+			(false, false) => CacheValueSource.FallbackLayerFresh,
+			(false, true) => CacheValueSource.FallbackLayerStale
+		};
+	}
+
+	/// <summary>
+	/// Resolves the source receipt for a cache entry served from the layer at <paramref name="layerIndex"/>,
+	/// evaluating the entry's freshness against the current time and the given <paramref name="settings"/>.
+	/// </summary>
+	private CacheValueSource GetSource<T>(int layerIndex, CacheEntry<T> cacheEntry, CacheSettings settings)
+	{
+		return GetSource(layerIndex, IsStale(cacheEntry, settings));
+	}
+
+	/// <summary>
+	/// Re-evaluates the freshness of a source receipt for the given <paramref name="cacheEntry"/>,
+	/// keeping the layer (or factory) the entry was resolved from.
+	/// </summary>
+	private static CacheValueSource WithFreshness<T>(CacheValueSource source, CacheEntry<T> cacheEntry, CacheSettings settings)
+	{
+		var isStale = IsStale(cacheEntry, settings);
+		return source switch
+		{
+			CacheValueSource.MemoryLayerFresh or CacheValueSource.MemoryLayerStale => isStale ? CacheValueSource.MemoryLayerStale : CacheValueSource.MemoryLayerFresh,
+			CacheValueSource.FallbackLayerFresh or CacheValueSource.FallbackLayerStale => isStale ? CacheValueSource.FallbackLayerStale : CacheValueSource.FallbackLayerFresh,
+			_ => source
+		};
+	}
+
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	private static bool IsStale<T>(CacheEntry<T> cacheEntry, CacheSettings settings)
+	{
+		var currentTime = DateTimeProvider.Now;
+		return cacheEntry.Expiry <= currentTime || cacheEntry.GetStaleDate(settings) < currentTime;
 	}
 
 	private async ValueTask BackPopulateCacheAsync<T>(int fromIndexExclusive, string cacheKey, CacheEntry<T> cacheEntry)
 	{
 		if (KeyLock.AcquireLock(cacheKey))
 		{
+			var source = GetSource(fromIndexExclusive, isStale: false);
 			try
 			{
 				for (; --fromIndexExclusive >= 0;)
@@ -353,36 +449,37 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 			}
 			finally
 			{
-				KeyLock.ReleaseLock(cacheKey, cacheEntry);
+				KeyLock.ReleaseLock(cacheKey, cacheEntry, source);
 			}
 		}
 	}
 
-	private async ValueTask<CacheEntry<T>?> RefreshValueAsync<T>(string cacheKey, Func<T, Task<T>> asyncValueFactory, CacheSettings settings, CacheEntryStatus entryStatus)
+	private async ValueTask<CacheFetchResult<T>?> RefreshValueAsync<T>(string cacheKey, Func<T, Task<T>> asyncValueFactory, CacheSettings settings, CacheEntryStatus entryStatus)
 	{
 		if (KeyLock.AcquireLock(cacheKey))
 		{
 			try
 			{
-				var previousEntry = await GetAsync<T>(cacheKey).ConfigureAwait(false);
+				var previousEntryPoint = await GetWithLayerIndexAsync<T>(cacheKey).ConfigureAwait(false);
+				var previousEntry = previousEntryPoint.CacheEntry;
 				if (previousEntry != default && entryStatus == CacheEntryStatus.Miss && previousEntry.Expiry >= DateTimeProvider.Now)
 				{
 					//The Cache Stack will always return an unexpired value if one exists.
 					//If we are told to refresh because one doesn't and we find one, we return the existing value, ignoring the refresh.
 					//This can happen due to the race condition of getting the values out of the cache.
 					//We can only do any of this because we have the local lock.
-					KeyLock.ReleaseLock(cacheKey, previousEntry);
-					return previousEntry;
+					var previousSource = GetSource(previousEntryPoint.LayerIndex, previousEntry, settings);
+					KeyLock.ReleaseLock(cacheKey, previousEntry, previousSource);
+					return new CacheFetchResult<T>(previousEntry.Value, previousSource);
 				}
 
 				await using var distributedLock = await Extensions.AwaitAccessAsync(cacheKey).ConfigureAwait(false);
 
-				CacheEntry<T>? cacheEntry;
 				if (distributedLock.IsLockOwner)
 				{
 					var oldValue = previousEntry != default ? previousEntry.Value : default;
 					var refreshedValue = await asyncValueFactory(oldValue!).ConfigureAwait(false);
-					cacheEntry = new CacheEntry<T>(refreshedValue, settings.TimeToLive);
+					var cacheEntry = new CacheEntry<T>(refreshedValue, settings.TimeToLive);
 					var cacheUpdateType = entryStatus switch
 					{
 						CacheEntryStatus.Miss => CacheUpdateType.AddEntry,
@@ -390,14 +487,20 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 					};
 					await InternalSetAsync(cacheKey, cacheEntry, cacheUpdateType).ConfigureAwait(false);
 
-					KeyLock.ReleaseLock(cacheKey, cacheEntry);
+					KeyLock.ReleaseLock(cacheKey, cacheEntry, CacheValueSource.Factory);
+					return new CacheFetchResult<T>(cacheEntry.Value, CacheValueSource.Factory);
 				}
 				else
 				{
-					cacheEntry = await GetAsync<T>(cacheKey).ConfigureAwait(false);
-				}
+					var currentEntryPoint = await GetWithLayerIndexAsync<T>(cacheKey).ConfigureAwait(false);
+					var currentEntry = currentEntryPoint.CacheEntry;
+					if (currentEntry == default)
+					{
+						return default;
+					}
 
-				return cacheEntry;
+					return new CacheFetchResult<T>(currentEntry.Value, GetSource(currentEntryPoint.LayerIndex, currentEntry, settings));
+				}
 			}
 			catch (Exception e)
 			{
@@ -408,15 +511,24 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 		else if (entryStatus != CacheEntryStatus.Stale)
 		{
 			//Last minute check to confirm whether waiting is required
-			var currentEntry = await GetAsync<T>(cacheKey).ConfigureAwait(false);
-			if (currentEntry != null && currentEntry.GetStaleDate(settings) > DateTimeProvider.Now)
+			var currentEntryPoint = await GetWithLayerIndexAsync<T>(cacheKey).ConfigureAwait(false);
+			var currentEntry = currentEntryPoint.CacheEntry;
+			if (currentEntry != default && currentEntry.GetStaleDate(settings) > DateTimeProvider.Now)
 			{
-				KeyLock.ReleaseLock(cacheKey, currentEntry);
-				return currentEntry;
+				var currentSource = GetSource(currentEntryPoint.LayerIndex, currentEntry, settings);
+				KeyLock.ReleaseLock(cacheKey, currentEntry, currentSource);
+				return new CacheFetchResult<T>(currentEntry.Value, currentSource);
 			}
 
 			//Lock until we are notified to be unlocked
-			return await KeyLock.WaitAsync(cacheKey).ConfigureAwait(false) as CacheEntry<T>;
+			var refreshResult = await KeyLock.WaitAsync(cacheKey).ConfigureAwait(false);
+			if (refreshResult.CacheEntry is not CacheEntry<T> refreshedEntry)
+			{
+				return default;
+			}
+
+			//Re-evaluate the freshness of the entry we were handed so the receipt reflects what was actually served.
+			return new CacheFetchResult<T>(refreshedEntry.Value, WithFreshness(refreshResult.Source, refreshedEntry, settings));
 		}
 
 		return default;

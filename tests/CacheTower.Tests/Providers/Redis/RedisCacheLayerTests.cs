@@ -15,6 +15,7 @@ namespace CacheTower.Tests.Providers.Redis
 		[TestInitialize]
 		public void Setup()
 		{
+			RedisHelper.ThrowIfUnavailable();
 			RedisHelper.ResetState();
 		}
 

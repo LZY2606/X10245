@@ -5,9 +5,30 @@ using System.Threading.Tasks;
 
 namespace CacheTower.Internal;
 
+/// <summary>
+/// The outcome handed to callers waiting on a cache key lock: the resolved cache entry and the source it was resolved from.
+/// </summary>
+internal readonly struct CacheEntryRefreshResult
+{
+	public CacheEntryRefreshResult(ICacheEntry cacheEntry, CacheValueSource source)
+	{
+		CacheEntry = cacheEntry;
+		Source = source;
+	}
+
+	/// <summary>
+	/// The cache entry that was resolved while the lock was held.
+	/// </summary>
+	public ICacheEntry CacheEntry { get; }
+	/// <summary>
+	/// The source the cache entry was resolved from.
+	/// </summary>
+	public CacheValueSource Source { get; }
+}
+
 internal readonly struct CacheEntryKeyLock
 {
-	private readonly Dictionary<string, TaskCompletionSource<ICacheEntry>?> keyLocks = new(StringComparer.Ordinal);
+	private readonly Dictionary<string, TaskCompletionSource<CacheEntryRefreshResult>?> keyLocks = new(StringComparer.Ordinal);
 
 	public CacheEntryKeyLock() { }
 
@@ -28,15 +49,15 @@ internal readonly struct CacheEntryKeyLock
 		}
 	}
 
-	public Task<ICacheEntry> WaitAsync(string cacheKey)
+	public Task<CacheEntryRefreshResult> WaitAsync(string cacheKey)
 	{
-		TaskCompletionSource<ICacheEntry>? completionSource;
+		TaskCompletionSource<CacheEntryRefreshResult>? completionSource;
 
 		lock (keyLocks)
 		{
 			if (!keyLocks.TryGetValue(cacheKey, out completionSource) || completionSource == null)
 			{
-				completionSource = new TaskCompletionSource<ICacheEntry>();
+				completionSource = new TaskCompletionSource<CacheEntryRefreshResult>();
 				keyLocks[cacheKey] = completionSource;
 			}
 		}
@@ -45,7 +66,7 @@ internal readonly struct CacheEntryKeyLock
 	}
 
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	private bool TryRemove(string cacheKey, out TaskCompletionSource<ICacheEntry>? completionSource)
+	private bool TryRemove(string cacheKey, out TaskCompletionSource<CacheEntryRefreshResult>? completionSource)
 	{
 		lock (keyLocks)
 		{
@@ -62,11 +83,11 @@ internal readonly struct CacheEntryKeyLock
 		}
 	}
 
-	public void ReleaseLock(string cacheKey, ICacheEntry cacheEntry)
+	public void ReleaseLock(string cacheKey, ICacheEntry cacheEntry, CacheValueSource source)
 	{
 		if (TryRemove(cacheKey, out var completionSource))
 		{
-			completionSource?.TrySetResult(cacheEntry);
+			completionSource?.TrySetResult(new CacheEntryRefreshResult(cacheEntry, source));
 		}
 	}
 

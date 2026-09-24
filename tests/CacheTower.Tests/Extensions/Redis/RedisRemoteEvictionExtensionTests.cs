@@ -11,6 +11,12 @@ namespace CacheTower.Tests.Extensions.Redis
 	[TestClass]
 	public class RedisRemoteEvictionExtensionTests
 	{
+		[TestInitialize]
+		public void RequireRedis()
+		{
+			RedisHelper.ThrowIfUnavailable();
+		}
+
 		[TestMethod, ExpectedException(typeof(ArgumentNullException))]
 		public void ThrowForNullConnection()
 		{
