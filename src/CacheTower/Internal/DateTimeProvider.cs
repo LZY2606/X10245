@@ -23,7 +23,30 @@ namespace CacheTower.Internal
 		[MethodImpl(MethodImplOptions.AggressiveInlining)]
 		public static void UpdateTime() => Now = DateTime.UtcNow;
 
+		/// <summary>
+		/// Test-only hook (visible via <c>InternalsVisibleTo</c>) to control the clock directly.
+		/// This sets the very same <see cref="Now"/> value that every production path reads,
+		/// so tests exercise the real time-dependent logic rather than a parallel implementation.
+		/// </summary>
+		/// <param name="now">The value to set <see cref="Now"/> to.</param>
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
+		internal static void SetNow(DateTime now) => Now = now;
+
+		/// <summary>
+		/// Test-only hook (visible via <c>InternalsVisibleTo</c>) to pause or resume the automatic
+		/// timer-based updates of <see cref="Now"/>. Defaults to <see langword="true"/> which is
+		/// the production behaviour; tests that use <see cref="SetNow"/> pause the timer so their
+		/// fake clock is not overwritten mid-test.
+		/// </summary>
+		internal static bool AutoUpdateEnabled { get; set; } = true;
+
 		[System.Diagnostics.CodeAnalysis.SuppressMessage("CodeQuality", "IDE0052:Remove unread private members", Justification = "Establishes timer and prevents it being garbage collected")]
-		private static readonly Timer DateTimeTimer = new(state => UpdateTime(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+		private static readonly Timer DateTimeTimer = new(state =>
+		{
+			if (AutoUpdateEnabled)
+			{
+				UpdateTime();
+			}
+		}, null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
 	}
 }
