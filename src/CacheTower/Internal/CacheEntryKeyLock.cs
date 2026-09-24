@@ -1,80 +1,204 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
-using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 
 namespace CacheTower.Internal;
 
-internal readonly struct CacheEntryKeyLock
+internal sealed class CacheEntryKeyLock
 {
-	private readonly Dictionary<string, TaskCompletionSource<ICacheEntry>?> keyLocks = new(StringComparer.Ordinal);
+	private sealed class LockState
+	{
+		public TaskCompletionSource<ICacheEntry>? RefreshCompletion;
+		public long Generation;
+		public bool IsActive;
+		public bool IsEvicting;
+		public bool EvictionStarted;
+		public TaskCompletionSource<object?>? EvictionCompletion;
+	}
+
+	private readonly Dictionary<string, LockState> keyLocks = new(StringComparer.Ordinal);
 
 	public CacheEntryKeyLock() { }
 
-	public bool AcquireLock(string cacheKey)
+	public bool AcquireLock(string cacheKey, out long generation)
 	{
 		lock (keyLocks)
 		{
-#if NETSTANDARD2_0
-			var hasLock = !keyLocks.ContainsKey(cacheKey);
-			if (hasLock)
+			if (!keyLocks.TryGetValue(cacheKey, out var state))
 			{
-				keyLocks[cacheKey] = null;
+				state = new LockState();
+				keyLocks[cacheKey] = state;
 			}
-			return hasLock;
-#elif NETSTANDARD2_1
-			return keyLocks.TryAdd(cacheKey, null);
-#endif
+
+			if (state.IsActive || state.IsEvicting)
+			{
+				generation = state.Generation;
+				return false;
+			}
+
+			state.IsActive = true;
+			state.RefreshCompletion = null;
+			generation = state.Generation;
+			return true;
 		}
 	}
 
 	public Task<ICacheEntry> WaitAsync(string cacheKey)
 	{
-		TaskCompletionSource<ICacheEntry>? completionSource;
-
 		lock (keyLocks)
 		{
-			if (!keyLocks.TryGetValue(cacheKey, out completionSource) || completionSource == null)
+			if (!keyLocks.TryGetValue(cacheKey, out var state) || !state.IsActive)
 			{
-				completionSource = new TaskCompletionSource<ICacheEntry>();
-				keyLocks[cacheKey] = completionSource;
+				return Task.FromResult<ICacheEntry>(new CacheEntry<object>(null, DateTime.MinValue));
 			}
-		}
 
-		return completionSource.Task;
+			var completionSource = state.RefreshCompletion;
+			if (completionSource == null)
+			{
+				completionSource = new TaskCompletionSource<ICacheEntry>(TaskCreationOptions.RunContinuationsAsynchronously);
+				state.RefreshCompletion = completionSource;
+			}
+
+			return completionSource.Task;
+		}
 	}
 
-	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	private bool TryRemove(string cacheKey, out TaskCompletionSource<ICacheEntry>? completionSource)
+	public long IncrementGeneration(string cacheKey)
 	{
 		lock (keyLocks)
 		{
-#if NETSTANDARD2_0
-			if (keyLocks.TryGetValue(cacheKey, out completionSource))
+			if (!keyLocks.TryGetValue(cacheKey, out var state))
 			{
-				keyLocks.Remove(cacheKey);
+				state = new LockState();
+				keyLocks[cacheKey] = state;
+			}
+
+			return ++state.Generation;
+		}
+	}
+
+	public bool IsEvictionInProgress(string cacheKey, long generation)
+	{
+		lock (keyLocks)
+		{
+			return keyLocks.TryGetValue(cacheKey, out var state) &&
+				state.IsActive &&
+				state.IsEvicting &&
+				state.Generation == generation;
+		}
+	}
+
+	public bool BeginEviction(string cacheKey, out long generation, out Task activeOperation)
+	{
+		lock (keyLocks)
+		{
+			if (!keyLocks.TryGetValue(cacheKey, out var state))
+			{
+				state = new LockState();
+				keyLocks[cacheKey] = state;
+			}
+
+			if (state.IsActive)
+			{
+				state.IsEvicting = true;
+				state.EvictionStarted = false;
+				if (state.RefreshCompletion == null)
+				{
+					state.RefreshCompletion = new TaskCompletionSource<ICacheEntry>(TaskCreationOptions.RunContinuationsAsynchronously);
+				}
+
+				generation = state.Generation;
+				activeOperation = state.RefreshCompletion.Task.ContinueWith(_ => { }, TaskScheduler.Default);
+				return false;
+			}
+
+			if (state.IsEvicting && state.EvictionStarted)
+			{
+				generation = state.Generation;
+				activeOperation = state.EvictionCompletion?.Task ?? Task.FromResult<object?>(null);
+				return false;
+			}
+
+			if (state.IsEvicting)
+			{
+				state.EvictionStarted = true;
+				state.EvictionCompletion = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+				generation = state.Generation;
+				activeOperation = Task.CompletedTask;
 				return true;
 			}
-			return false;
-#elif NETSTANDARD2_1
-			return keyLocks.Remove(cacheKey, out completionSource);
-#endif
+
+			state.IsEvicting = true;
+			state.EvictionStarted = true;
+			state.RefreshCompletion = null;
+			state.EvictionCompletion = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+			generation = ++state.Generation;
+			return true;
 		}
 	}
 
-	public void ReleaseLock(string cacheKey, ICacheEntry cacheEntry)
+	public void EndEviction(string cacheKey, long generation)
 	{
-		if (TryRemove(cacheKey, out var completionSource))
+		lock (keyLocks)
+		{
+			if (keyLocks.TryGetValue(cacheKey, out var state) &&
+				state.IsEvicting &&
+				state.Generation == generation)
+			{
+				state.EvictionCompletion?.TrySetResult(null);
+				state.IsEvicting = false;
+				state.EvictionStarted = false;
+				state.EvictionCompletion = null;
+				state.RefreshCompletion = null;
+				keyLocks.Remove(cacheKey);
+			}
+		}
+	}
+
+	private bool TryRelease(string cacheKey, long generation, out TaskCompletionSource<ICacheEntry>? completionSource)
+	{
+		lock (keyLocks)
+		{
+			if (!keyLocks.TryGetValue(cacheKey, out var state) ||
+				!state.IsActive ||
+				state.Generation != generation)
+			{
+				completionSource = null;
+				return false;
+			}
+
+			completionSource = state.RefreshCompletion;
+			state.IsActive = false;
+			state.RefreshCompletion = null;
+			if (!state.IsEvicting)
+			{
+				keyLocks.Remove(cacheKey);
+			}
+			return true;
+		}
+	}
+
+	public void ReleaseLock(string cacheKey, long generation, ICacheEntry cacheEntry)
+	{
+		if (TryRelease(cacheKey, generation, out var completionSource))
 		{
 			completionSource?.TrySetResult(cacheEntry);
 		}
 	}
 
-	public void ReleaseLock(string cacheKey, Exception exception)
+	public void ReleaseLockForEviction(string cacheKey, long generation)
 	{
-		if (TryRemove(cacheKey, out var completionSource))
+		if (TryRelease(cacheKey, generation, out var completionSource))
 		{
-			completionSource?.SetException(exception);
+			completionSource?.TrySetResult(new CacheEntry<object>(null, DateTime.MinValue));
+		}
+	}
+
+	public void ReleaseLock(string cacheKey, long generation, Exception exception)
+	{
+		if (TryRelease(cacheKey, generation, out var completionSource))
+		{
+			completionSource?.TrySetException(exception);
 		}
 	}
 }

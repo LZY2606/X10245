@@ -17,7 +17,14 @@ namespace CacheTower
 		/// <remarks>
 		/// While optional, the cache will not perform a background refresh if <see cref="StaleAfter"/> is not set.
 		/// </remarks>
-		public TimeSpan? StaleAfter { get; }
+	public TimeSpan? StaleAfter { get; }
+	/// <summary>
+	/// How long an expired entry may be served while its value is revalidated.
+	/// </summary>
+	/// <remarks>
+	/// When not set, expired entries force a foreground refresh as in previous versions.
+	/// </remarks>
+	public TimeSpan? StaleWhileRevalidate { get; }
 
 		/// <summary>
 		/// Configures the cache entry to have a life of <paramref name="timeToLive"/>.
@@ -26,11 +33,12 @@ namespace CacheTower
 		/// How long till a cache entry is considered expired.
 		/// Expired entries are removed from the cache and will force a foreground refresh if there is a cache miss.
 		/// </param>
-		public CacheSettings(TimeSpan timeToLive)
-		{
-			TimeToLive = timeToLive;
-			StaleAfter = null;
-		}
+	public CacheSettings(TimeSpan timeToLive)
+	{
+		TimeToLive = timeToLive;
+		StaleAfter = null;
+		StaleWhileRevalidate = null;
+	}
 
 		/// <summary>
 		/// Configures the cache entry to have a life of <paramref name="timeToLive"/> and to be considered stale after <paramref name="staleAfter"/>.
@@ -51,10 +59,29 @@ namespace CacheTower
 		/// You will need to decide on the appropriate value based on your own usage.
 		/// </para>
 		/// </param>
-		public CacheSettings(TimeSpan timeToLive, TimeSpan staleAfter)
-		{
-			TimeToLive = timeToLive;
-			StaleAfter = staleAfter;
-		}
+	public CacheSettings(TimeSpan timeToLive, TimeSpan staleAfter)
+	{
+		TimeToLive = timeToLive;
+		StaleAfter = staleAfter;
+		StaleWhileRevalidate = null;
 	}
+
+	/// <summary>
+	/// Configures the cache entry with stale-while-revalidate behavior for expired entries.
+	/// </summary>
+	/// <param name="timeToLive">How long till a cache entry is considered expired.</param>
+	/// <param name="staleAfter">How long till a still-unexpired entry is considered stale and eligible for background refresh.</param>
+	/// <param name="staleWhileRevalidate">How long after expiry an entry may be returned while a single refresh is performed.</param>
+	public CacheSettings(TimeSpan timeToLive, TimeSpan staleAfter, TimeSpan staleWhileRevalidate)
+	{
+		if (staleWhileRevalidate < TimeSpan.Zero)
+		{
+			throw new ArgumentOutOfRangeException(nameof(staleWhileRevalidate), "Stale-while-revalidate must not be negative.");
+		}
+
+		TimeToLive = timeToLive;
+		StaleAfter = staleAfter;
+		StaleWhileRevalidate = staleWhileRevalidate;
+	}
+}
 }
