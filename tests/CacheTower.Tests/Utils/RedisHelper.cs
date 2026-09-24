@@ -1,6 +1,7 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
 using StackExchange.Redis;
 
 namespace CacheTower.Tests.Utils;
@@ -10,27 +11,50 @@ public static class RedisHelper
 	public static string Endpoint => Environment.GetEnvironmentVariable("REDIS_ENDPOINT") ?? "localhost:6379";
 
 	private static readonly ConcurrentQueue<string> Errors = new();
-
-	static RedisHelper()
-	{
-		var connection = GetConnection();
-		connection.ErrorMessage += (sender, args) =>
-		{
-			Errors.Enqueue(args.Message);
-		};
-		connection.InternalError += (sender, args) =>
-		{
-			if (args.Exception is not null)
-			{
-				Errors.Enqueue(args.Exception.Message);
-			}
-		};
-	}
+	private static readonly Lazy<bool> Availability = new(ProbeAvailability);
 
 	private static ConnectionMultiplexer Connection { get; set; }
 
+	/// <summary>
+	/// Whether a Redis server is reachable at <see cref="Endpoint"/>. Probed once with a short timeout.
+	/// </summary>
+	public static bool IsAvailable => Availability.Value;
+
+	private static bool ProbeAvailability()
+	{
+		try
+		{
+			var config = new ConfigurationOptions
+			{
+				ConnectTimeout = 1000,
+				ConnectRetry = 0,
+				AbortOnConnectFail = false
+			};
+			config.EndPoints.Add(Endpoint);
+			using var probe = ConnectionMultiplexer.Connect(config);
+			return probe.IsConnected;
+		}
+		catch
+		{
+			return false;
+		}
+	}
+
+	/// <summary>
+	/// Marks the current test as inconclusive when no Redis server is available, allowing
+	/// the test suite to run on machines without a Redis service.
+	/// </summary>
+	public static void ThrowIfUnavailable()
+	{
+		if (!IsAvailable)
+		{
+			Assert.Inconclusive($"Redis is not available at {Endpoint}; set the REDIS_ENDPOINT environment variable to run this test.");
+		}
+	}
+
 	public static ConnectionMultiplexer GetConnection()
 	{
+		ThrowIfUnavailable();
 		if (Connection == null)
 		{
 			var config = new ConfigurationOptions
@@ -39,6 +63,17 @@ public static class RedisHelper
 			};
 			config.EndPoints.Add(Endpoint);
 			Connection = ConnectionMultiplexer.Connect(config);
+			Connection.ErrorMessage += (sender, args) =>
+			{
+				Errors.Enqueue(args.Message);
+			};
+			Connection.InternalError += (sender, args) =>
+			{
+				if (args.Exception is not null)
+				{
+					Errors.Enqueue(args.Exception.Message);
+				}
+			};
 		}
 		return Connection;
 	}
@@ -48,6 +83,7 @@ public static class RedisHelper
 	/// </summary>
 	public static void ResetState()
 	{
+		ThrowIfUnavailable();
 		GetConnection().GetServer(Endpoint).FlushDatabase();
 		GetConnection().GetSubscriber().UnsubscribeAll();
 		
