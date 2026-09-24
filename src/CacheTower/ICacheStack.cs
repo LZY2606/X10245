@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace CacheTower
@@ -124,6 +125,30 @@ namespace CacheTower
 	}
 
 	/// <remarks>
+	/// An <see cref="IStaleWhileRevalidateCacheStack"/> exposes the opt-in stale-while-revalidate read strategy.
+	/// This is intentionally exposed as a separate interface so the default read policy of <see cref="ICacheStack"/> remains completely unchanged.
+	/// </remarks>
+	/// <inheritdoc/>
+	public interface IStaleWhileRevalidateCacheStack : ICacheStack
+	{
+		/// <summary>
+		/// Attempts to retrieve the value for the given <paramref name="cacheKey"/> using the stale-while-revalidate read strategy.
+		/// </summary>
+		/// <remarks>
+		/// Expired entries may be returned for up to <see cref="StaleWhileRevalidateOptions.StaleWindow"/> past their expiry.
+		/// When an expired entry is served, a single background refresh per key is triggered; concurrent reads share that one refresh.
+		/// Cancelling <paramref name="cancellationToken"/> only abandons this caller's wait - it never cancels the shared refresh.
+		/// </remarks>
+		/// <typeparam name="T">The type of value in the cache entry.</typeparam>
+		/// <param name="cacheKey">The cache entry's key.</param>
+		/// <param name="valueFactory">The value factory called when no cache entry is available.</param>
+		/// <param name="options">The stale-while-revalidate options for this read.</param>
+		/// <param name="cancellationToken">A token that abandons this caller's wait without cancelling the shared refresh.</param>
+		/// <returns>A <see cref="CacheReadResult{T}"/> pairing the value with a <see cref="CacheReadSource"/> receipt. The receipt never changes the value.</returns>
+		ValueTask<CacheReadResult<T>> GetOrSetAsync<T>(string cacheKey, Func<T, Task<T>> valueFactory, StaleWhileRevalidateOptions options, CancellationToken cancellationToken = default);
+	}
+
+	/// <remarks>
 	/// An <see cref="ICacheStack{TContext}"/> provides an additional <c>GetOrSetAsync</c> method that passes in a context object.
 	/// This context allows easier access to inject dependencies like database contexts or any other type needed to help generate the item to cache.
 	/// </remarks>
@@ -136,5 +161,19 @@ namespace CacheTower
 		/// </remarks>
 		/// <inheritdoc cref="ICacheStack.GetOrSetAsync{T}(string, Func{T, Task{T}}, CacheSettings)"/>
 		ValueTask<T> GetOrSetAsync<T>(string cacheKey, Func<T, TContext, Task<T>> valueFactory, CacheSettings settings);
+	}
+
+	/// <remarks>
+	/// An <see cref="IStaleWhileRevalidateCacheStack{TContext}"/> provides the stale-while-revalidate read strategy with access to a context object during refreshing.
+	/// </remarks>
+	/// <typeparam name="TContext">The type of context that is passed during the cache entry generation process.</typeparam>
+	/// <inheritdoc/>
+	public interface IStaleWhileRevalidateCacheStack<out TContext> : ICacheStack<TContext>, IStaleWhileRevalidateCacheStack
+	{
+		/// <remarks>
+		/// Additionally provides access to a context object during refreshing, allowing easier access to inject dependencies.
+		/// </remarks>
+		/// <inheritdoc cref="IStaleWhileRevalidateCacheStack.GetOrSetAsync{T}(string, Func{T, Task{T}}, StaleWhileRevalidateOptions, CancellationToken)"/>
+		ValueTask<CacheReadResult<T>> GetOrSetAsync<T>(string cacheKey, Func<T, TContext, Task<T>> valueFactory, StaleWhileRevalidateOptions options, CancellationToken cancellationToken = default);
 	}
 }

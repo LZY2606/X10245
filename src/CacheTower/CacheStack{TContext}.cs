@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 
@@ -10,7 +11,7 @@ namespace CacheTower;
 /// </remarks>
 /// <typeparam name="TContext">The type of context that is passed to <see cref="GetOrSetAsync{T}(string, Func{T, TContext, Task{T}}, CacheSettings)"/>.</typeparam>
 /// <inheritdoc/>
-public class CacheStack<TContext> : CacheStack, ICacheStack<TContext>
+public class CacheStack<TContext> : CacheStack, ICacheStack<TContext>, IStaleWhileRevalidateCacheStack<TContext>
 {
 	private readonly ICacheContextActivator CacheContextActivator;
 
@@ -59,5 +60,28 @@ public class CacheStack<TContext> : CacheStack, ICacheStack<TContext>
 			var context = (TContext)scope.Resolve(typeof(TContext));
 			return await getter(old, context).ConfigureAwait(false);
 		}, settings).ConfigureAwait(false);
+	}
+
+	/// <inheritdoc/>
+	public async ValueTask<CacheReadResult<T>> GetOrSetAsync<T>(string cacheKey, Func<T, TContext, Task<T>> valueFactory, StaleWhileRevalidateOptions options, CancellationToken cancellationToken = default)
+	{
+		ThrowIfDisposed();
+
+		if (cacheKey == null)
+		{
+			throw new ArgumentNullException(nameof(cacheKey));
+		}
+
+		if (valueFactory == null)
+		{
+			throw new ArgumentNullException(nameof(valueFactory));
+		}
+
+		return await GetOrSetAsync<T>(cacheKey, async (old) =>
+		{
+			using var scope = CacheContextActivator.BeginScope();
+			var context = (TContext)scope.Resolve(typeof(TContext));
+			return await valueFactory(old, context).ConfigureAwait(false);
+		}, options, cancellationToken).ConfigureAwait(false);
 	}
 }
