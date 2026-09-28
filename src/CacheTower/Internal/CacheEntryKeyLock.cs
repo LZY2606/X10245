@@ -1,6 +1,7 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace CacheTower.Internal;
@@ -28,6 +29,31 @@ internal readonly struct CacheEntryKeyLock
 		}
 	}
 
+	/// <summary>
+	/// Whether a refresh (owner or waiting callers) is currently registered for <paramref name="cacheKey"/>.
+	/// </summary>
+	public bool IsLocked(string cacheKey)
+	{
+		lock (keyLocks)
+		{
+			return keyLocks.ContainsKey(cacheKey);
+		}
+	}
+
+	/// <summary>
+	/// Whether at least one caller is currently waiting to be released for <paramref name="cacheKey"/>.
+	/// </summary>
+	/// <remarks>
+	/// Test-only observation point for synchronizing deterministic concurrency tests. It does not alter locking behaviour.
+	/// </remarks>
+	public bool HasWaiter(string cacheKey)
+	{
+		lock (keyLocks)
+		{
+			return keyLocks.TryGetValue(cacheKey, out var completionSource) && completionSource != null;
+		}
+	}
+
 	public Task<ICacheEntry> WaitAsync(string cacheKey)
 	{
 		TaskCompletionSource<ICacheEntry>? completionSource;
@@ -42,6 +68,30 @@ internal readonly struct CacheEntryKeyLock
 		}
 
 		return completionSource.Task;
+	}
+
+	/// <summary>
+	/// Waits for the shared refresh to finish, observing <paramref name="cancellationToken"/> without cancelling the refresh itself.
+	/// </summary>
+	/// <remarks>
+	/// Cancellation only completes this caller's wait - the shared <see cref="TaskCompletionSource{TResult}"/> is never cancelled,
+	/// so the in-flight refresh and every other waiter are unaffected.
+	/// </remarks>
+	public async Task<ICacheEntry> WaitAsync(string cacheKey, CancellationToken cancellationToken)
+	{
+		var refreshTask = WaitAsync(cacheKey);
+
+		if (!cancellationToken.CanBeCanceled || refreshTask.IsCompleted)
+		{
+			return await refreshTask.ConfigureAwait(false);
+		}
+
+		var cancellationCompletion = new TaskCompletionSource<ICacheEntry>(TaskCreationOptions.RunContinuationsAsynchronously);
+		using (cancellationToken.Register(static state => ((TaskCompletionSource<ICacheEntry>)state!).TrySetCanceled(), cancellationCompletion))
+		{
+			var completedTask = await Task.WhenAny(refreshTask, cancellationCompletion.Task).ConfigureAwait(false);
+			return await completedTask.ConfigureAwait(false);
+		}
 	}
 
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]

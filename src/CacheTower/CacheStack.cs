@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 using CacheTower.Extensions;
 using CacheTower.Internal;
@@ -52,6 +53,10 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 	private readonly ILogger<CacheStack> Logger;
 	private readonly ICacheLayer[] CacheLayers;
 	private readonly ExtensionContainer Extensions;
+
+	//Records how many times a key was explicitly evicted. Shared refreshes capture the value before they start and,
+	//for the opt-in stale-while-revalidate strategy, refuse to write back if an eviction raced with their completion.
+	private readonly Dictionary<string, int> EvictionVersions = new(StringComparer.Ordinal);
 
 	/// <summary>
 	/// Creates a new <see cref="CacheStack"/> with the provided <paramref name="options"/>.
@@ -140,8 +145,55 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 			await layer.EvictAsync(cacheKey).ConfigureAwait(false);
 		}
 
+		RecordEviction(cacheKey);
+
 		await Extensions.OnCacheEvictionAsync(cacheKey).ConfigureAwait(false);
 	}
+
+	private void RecordEviction(string cacheKey)
+	{
+		lock (EvictionVersions)
+		{
+			EvictionVersions.TryGetValue(cacheKey, out var version);
+			EvictionVersions[cacheKey] = version + 1;
+		}
+	}
+
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	private int CaptureEvictionVersion(string cacheKey)
+	{
+		lock (EvictionVersions)
+		{
+			return EvictionVersions.TryGetValue(cacheKey, out var version) ? version : 0;
+		}
+	}
+
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	private bool IsEvictionVersionCurrent(string cacheKey, int capturedVersion)
+	{
+		lock (EvictionVersions)
+		{
+			return (!EvictionVersions.TryGetValue(cacheKey, out var version) ? 0 : version) == capturedVersion;
+		}
+	}
+
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	private void ClearEvictionVersionIfUnchanged(string cacheKey, int capturedVersion)
+	{
+		lock (EvictionVersions)
+		{
+			if ((!EvictionVersions.TryGetValue(cacheKey, out var version) ? 0 : version) == capturedVersion)
+			{
+				EvictionVersions.Remove(cacheKey);
+			}
+		}
+	}
+
+	//Test-only observation points for deterministic concurrency tests. They read the same single-flight lock the
+	//production path uses; they never drive it.
+	internal bool IsRefreshInFlight(string cacheKey) => KeyLock.IsLocked(cacheKey);
+
+	internal bool HasWaitingRefreshCaller(string cacheKey) => KeyLock.HasWaiter(cacheKey);
 
 	/// <inheritdoc/>
 	public async ValueTask<CacheEntry<T>> SetAsync<T>(string cacheKey, T value, TimeSpan timeToLive)
@@ -336,6 +388,92 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 		return (await RefreshValueAsync(cacheKey, valueFactory, settings, cacheEntryStatus).ConfigureAwait(false))!.Value!;
 	}
 
+	/// <inheritdoc/>
+	public async ValueTask<CacheReadResult<T>> GetOrSetWithStaleWhileRevalidateAsync<T>(
+		string cacheKey,
+		Func<T, Task<T>> valueFactory,
+		StaleWhileRevalidateSettings settings,
+		CancellationToken cancellationToken = default
+	)
+	{
+		ThrowIfDisposed();
+
+		if (cacheKey == null)
+		{
+			throw new ArgumentNullException(nameof(cacheKey));
+		}
+
+		if (valueFactory == null)
+		{
+			throw new ArgumentNullException(nameof(valueFactory));
+		}
+
+		cancellationToken.ThrowIfCancellationRequested();
+
+		var currentTime = DateTimeProvider.Now;
+		var cacheEntryPoint = await GetWithLayerIndexAsync<T>(cacheKey).ConfigureAwait(false);
+
+		if (cacheEntryPoint != default)
+		{
+			var cacheEntry = cacheEntryPoint.CacheEntry;
+
+			if (cacheEntry.Expiry > currentTime)
+			{
+				//Fresh data: return it directly, back-populating lower layers in the background like the default strategy.
+				if (cacheEntryPoint.LayerIndex > 0)
+				{
+					_ = BackPopulateCacheAsync(cacheEntryPoint.LayerIndex, cacheKey, cacheEntry);
+				}
+
+				var freshSource = cacheEntryPoint.LayerIndex == 0 ? CacheReadSource.MemoryLayer : CacheReadSource.FallbackLayer;
+				var freshReceipt = new CacheReadReceipt(freshSource, cacheEntryPoint.LayerIndex, cacheEntry.Expiry, false);
+				return new CacheReadResult<T>(cacheEntry.Value!, freshReceipt);
+			}
+
+			if (currentTime - cacheEntry.Expiry <= settings.StaleWindow)
+			{
+				//Expired but still inside the stale-while-revalidate window: serve the stale value and refresh with single-flight.
+				//The background refresh is intentionally not linked to the caller's token - cancellation must not cancel a shared refresh.
+				//A failed refresh writes nothing, so the window remains measured from this entry's original expiry and is never extended.
+				var evictionVersion = CaptureEvictionVersion(cacheKey);
+				_ = RefreshValueAsyncCore(
+					cacheKey,
+					valueFactory,
+					settings.ToCacheSettings(),
+					CacheEntryStatus.Expired,
+					evictionVersion,
+					CancellationToken.None
+				);
+
+				var staleReceipt = new CacheReadReceipt(CacheReadSource.Stale, cacheEntryPoint.LayerIndex, cacheEntry.Expiry, true);
+				return new CacheReadResult<T>(cacheEntry.Value!, staleReceipt);
+			}
+		}
+
+		//No data or expired beyond the window: wait for a foreground single-flight refresh.
+		var entryStatus = cacheEntryPoint == default ? CacheEntryStatus.Miss : CacheEntryStatus.Expired;
+		var refreshVersion = CaptureEvictionVersion(cacheKey);
+		var refreshResult = await RefreshValueAsyncCore(
+			cacheKey,
+			valueFactory,
+			settings.ToCacheSettings(),
+			entryStatus,
+			refreshVersion,
+			cancellationToken
+		).ConfigureAwait(false);
+
+		if (refreshResult.CacheEntry == null)
+		{
+			//The source cannot be determined (for example, a distributed lock was lost and no entry was visible).
+			//Report this explicitly rather than presenting an unbacked value as successful.
+			return new CacheReadResult<T>(default, CacheReadReceipt.Unknown);
+		}
+
+		var source = refreshResult.WasFactoryCaller ? CacheReadSource.Factory : CacheReadSource.Fresh;
+		var receipt = new CacheReadReceipt(source, -1, refreshResult.CacheEntry.Expiry, true);
+		return new CacheReadResult<T>(refreshResult.CacheEntry.Value!, receipt);
+	}
+
 	private async ValueTask BackPopulateCacheAsync<T>(int fromIndexExclusive, string cacheKey, CacheEntry<T> cacheEntry)
 	{
 		if (KeyLock.AcquireLock(cacheKey))
@@ -360,8 +498,29 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 
 	private async ValueTask<CacheEntry<T>?> RefreshValueAsync<T>(string cacheKey, Func<T, Task<T>> asyncValueFactory, CacheSettings settings, CacheEntryStatus entryStatus)
 	{
+		return (await RefreshValueAsyncCore(cacheKey, asyncValueFactory, settings, entryStatus, -1, CancellationToken.None).ConfigureAwait(false)).CacheEntry;
+	}
+
+	/// <param name="capturedEvictionVersion">
+	/// The eviction version captured by the caller. A value of <c>-1</c> disables the eviction race check, which keeps the
+	/// default (non stale-while-revalidate) read strategy unchanged.
+	/// </param>
+	/// <param name="cancellationToken">
+	/// A token that cancels this caller's wait on a shared refresh. It is never passed to the value factory and so never
+	/// cancels a refresh started by another caller.
+	/// </param>
+	private async ValueTask<(CacheEntry<T>? CacheEntry, bool WasFactoryCaller)> RefreshValueAsyncCore<T>(
+		string cacheKey,
+		Func<T, Task<T>> asyncValueFactory,
+		CacheSettings settings,
+		CacheEntryStatus entryStatus,
+		int capturedEvictionVersion,
+		CancellationToken cancellationToken
+	)
+	{
 		if (KeyLock.AcquireLock(cacheKey))
 		{
+			var wasFactoryCaller = false;
 			try
 			{
 				var previousEntry = await GetAsync<T>(cacheKey).ConfigureAwait(false);
@@ -371,8 +530,9 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 					//If we are told to refresh because one doesn't and we find one, we return the existing value, ignoring the refresh.
 					//This can happen due to the race condition of getting the values out of the cache.
 					//We can only do any of this because we have the local lock.
+					ClearEvictionVersionIfUnchanged(cacheKey, capturedEvictionVersion);
 					KeyLock.ReleaseLock(cacheKey, previousEntry);
-					return previousEntry;
+					return (previousEntry, false);
 				}
 
 				await using var distributedLock = await Extensions.AwaitAccessAsync(cacheKey).ConfigureAwait(false);
@@ -388,7 +548,15 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 						CacheEntryStatus.Miss => CacheUpdateType.AddEntry,
 						_ => CacheUpdateType.AddOrUpdateEntry
 					};
-					await InternalSetAsync(cacheKey, cacheEntry, cacheUpdateType).ConfigureAwait(false);
+
+					if (capturedEvictionVersion < 0 || IsEvictionVersionCurrent(cacheKey, capturedEvictionVersion))
+					{
+						await InternalSetAsync(cacheKey, cacheEntry, cacheUpdateType).ConfigureAwait(false);
+						ClearEvictionVersionIfUnchanged(cacheKey, capturedEvictionVersion);
+					}
+					//If an eviction raced with this refresh's completion, deliberately do not write back - the key must not be resurrected.
+
+					wasFactoryCaller = true;
 
 					KeyLock.ReleaseLock(cacheKey, cacheEntry);
 				}
@@ -397,7 +565,7 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 					cacheEntry = await GetAsync<T>(cacheKey).ConfigureAwait(false);
 				}
 
-				return cacheEntry;
+				return (cacheEntry, wasFactoryCaller);
 			}
 			catch (Exception e)
 			{
@@ -412,14 +580,15 @@ public class CacheStack : ICacheStack, IFlushableCacheStack, IExtendableCacheSta
 			if (currentEntry != null && currentEntry.GetStaleDate(settings) > DateTimeProvider.Now)
 			{
 				KeyLock.ReleaseLock(cacheKey, currentEntry);
-				return currentEntry;
+				return (currentEntry, false);
 			}
 
 			//Lock until we are notified to be unlocked
-			return await KeyLock.WaitAsync(cacheKey).ConfigureAwait(false) as CacheEntry<T>;
+			var waitedEntry = await KeyLock.WaitAsync(cacheKey, cancellationToken).ConfigureAwait(false) as CacheEntry<T>;
+			return (waitedEntry, false);
 		}
 
-		return default;
+		return (default(CacheEntry<T>), false);
 	}
 
 	/// <summary>
